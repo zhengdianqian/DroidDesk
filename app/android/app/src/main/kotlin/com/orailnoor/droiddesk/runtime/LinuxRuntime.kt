@@ -68,6 +68,7 @@ class LinuxRuntime(private val context: Context) {
         // wrappers operate on the same session.
         @Volatile private var sessionProcess: Process? = null
         @Volatile private var dbusProcess: Process? = null
+        @Volatile private var a11yBusProcess: Process? = null
     }
 
     @Volatile private var activeCommandProcess: Process? = null
@@ -2225,6 +2226,86 @@ class LinuxRuntime(private val context: Context) {
             throw IllegalStateException("会话总线（dbus）启动失败：${e.message}", e)
         }
 
+        // GTK3 loads its accessibility bridge as a GtkModule named "atk-bridge". The
+        // Termux bootstrap ships libatk-bridge-2.0.so but not the module directory GTK
+        // searches, so without this link no focus event ever reaches the a11y bus.
+        runCatching {
+            val moduleDir = File(prefixDir, "lib/gtk-3.0/3.0.0/modules").apply { mkdirs() }
+            val link = File(moduleDir, "libatk-bridge.so")
+            if (File(prefixDir, "lib/libatk-bridge-2.0.so").isFile && !link.exists()) {
+                java.nio.file.Files.createSymbolicLink(
+                    link.toPath(),
+                    java.nio.file.Paths.get("../../../libatk-bridge-2.0.so"),
+                )
+                DesktopLog.append(context, TAG, "linked GTK atk-bridge module")
+            }
+        }.onFailure { DesktopLog.append(context, TAG, "atk-bridge link failed: ${it.message}") }
+
+        // Accessibility needs its own bus. at-spi's launcher is hard-wired to
+        // /data/data/com.termux/files/usr/bin/dbus-daemon, which does not exist here, so
+        // DroidDesk starts the bus itself and exports AT_SPI_BUS_ADDRESS (libatspi honours
+        // it). The IME bridge reads focus events from that bus.
+        val a11ySocket = File(tmpDir, "a11y-bus")
+        try {
+            a11yBusProcess?.destroyForcibly()
+            if (a11ySocket.exists()) a11ySocket.delete()
+            val a11yConfig = File(tmpDir, "dbus-a11y.conf")
+            a11yConfig.writeText(
+                """
+                <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+                 "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+                <busconfig>
+                  <type>session</type>
+                  <listen>unix:path=${a11ySocket.absolutePath}</listen>
+                  <auth>EXTERNAL</auth>
+                  <policy context="default">
+                    <allow send_destination="*" eavesdrop="true"/>
+                    <allow eavesdrop="true"/>
+                    <allow own="*"/>
+                  </policy>
+                </busconfig>
+                """.trimIndent() + "\n",
+            )
+            val startedA11y = ProcessBuilder(
+                listOf(
+                    File(prefixDir, "bin/dbus-daemon").absolutePath,
+                    "--config-file=${a11yConfig.absolutePath}",
+                    "--nofork",
+                    "--nopidfile",
+                ),
+            )
+                .directory(homeDir)
+                .redirectErrorStream(true)
+                .also { pb ->
+                    pb.environment().clear()
+                    pb.environment().putAll(getTermuxEnv())
+                }
+                .start()
+            a11yBusProcess = startedA11y
+            Thread {
+                runCatching {
+                    startedA11y.inputStream.bufferedReader().forEachLine {
+                        Log.d(TAG, "A11Y: $it")
+                    }
+                }
+            }.start()
+            val a11yDeadline = System.currentTimeMillis() + 2_000
+            while (!a11ySocket.exists() && startedA11y.isAlive &&
+                System.currentTimeMillis() < a11yDeadline
+            ) {
+                Thread.sleep(20)
+            }
+            if (a11ySocket.exists()) {
+                DesktopLog.append(context, TAG, "a11y bus ready at ${a11ySocket.absolutePath}")
+            } else {
+                DesktopLog.append(context, TAG, "a11y bus did not create its socket")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "a11y bus start failed: ${e.message}")
+            DesktopLog.append(context, TAG, "a11y bus start failed: ${e.message}")
+            a11yBusProcess = null
+        }
+
         // The Termux startxfce4 wrapper falls back to Android's /bin/sh when an
         // X server already exists, which corrupts DISPLAY on recent Android
         // releases. The session binary starts the same XFCE components and
@@ -2239,6 +2320,7 @@ class LinuxRuntime(private val context: Context) {
             unset GTK_A11Y
             export GTK_MODULES=gail:atk-bridge
             export DISPLAY=:0
+            export AT_SPI_BUS_ADDRESS="unix:path=${a11ySocket.absolutePath}"
 
             # Use the session bus DroidDesk already started
             export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbusSocket.absolutePath}"
@@ -2297,9 +2379,9 @@ write_state() {
         printf '%s\n' "${'$'}1" > "${'$'}FOCUS" 2>/dev/null || true
     fi
 }
-ADDR=""
+ADDR="${'$'}{AT_SPI_BUS_ADDRESS:-}"
 i=0
-while [ "${'$'}i" -lt 30 ]; do
+while [ -z "${'$'}ADDR" ] && [ "${'$'}i" -lt 10 ]; do
     ADDR="${'$'}(dbus-send --session --print-reply --dest=org.a11y.Bus \
         /org/a11y/bus org.a11y.Bus.GetAddress 2>/dev/null |
         sed -n 's/^ *string "\(.*\)"${'$'}/\1/p')"
@@ -2444,6 +2526,8 @@ DROIDDESK_SH
         sessionProcess = null
         dbusProcess?.destroyForcibly()
         dbusProcess = null
+        a11yBusProcess?.destroyForcibly()
+        a11yBusProcess = null
         // A killed session manager often leaves panels/wm alive; the next launch would
         // attach to those zombies instead of painting a fresh desktop.
         cleanupStaleSession()
