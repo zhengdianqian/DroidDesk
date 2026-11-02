@@ -385,26 +385,35 @@ class ChrootRuntime(private val context: Context) {
      * Start the chrooted desktop session.
      * The caller should ensure the X11 socket directory is mounted before this.
      */
-    fun startSession(desktopEnv: String = "xfce4", width: Int = 1920, height: Int = 1080) {
+    fun startSession(
+        desktopEnv: String = "xfce4",
+        width: Int = 1920,
+        height: Int = 1080,
+        onPhase: (String) -> Unit = {},
+    ) {
         if (!hasRoot()) {
-            Log.e(TAG, "Cannot start chroot session without root")
-            return
+            throw IllegalStateException("未获得 root 权限，无法启动 Ubuntu 桌面")
         }
         if (!isRootfsReady()) {
-            Log.e(TAG, "Rootfs not ready")
-            return
+            throw IllegalStateException("Ubuntu 镜像尚未安装完成，请先在设置中安装/修复 Ubuntu")
         }
         if (isRunning()) {
             Log.w(TAG, "Chroot session already running")
             return
         }
 
+        onPhase("清理上次会话残留")
+        cleanupStaleSession()
+        DesktopLog.append(context, TAG, "chroot session start requested (${width}x$height)")
+
+        onPhase("检查兼容库")
         // Existing rootfs installations predate the compatibility library.
         // Build it once before starting XFCE so they do not need a reinstall.
         if (!ensureCloseRangeCompatibility()) {
-            Log.e(TAG, "Cannot start chroot desktop: close_range compatibility setup failed")
-            return
+            throw IllegalStateException("兼容库初始化失败（close_range），请重试")
         }
+
+        onPhase("应用桌面配置")
 
         // The profile is staged in app storage (see installChrootXfceMobileProfile), so its
         // version marker lives there rather than in the root-owned chroot home.
@@ -428,8 +437,14 @@ class ChrootRuntime(private val context: Context) {
             }.onFailure { Log.w(TAG, "Android desktop launchers could not be refreshed", it) }
         }
 
+        onPhase("挂载运行环境")
         ensureMounts()
         bindX11Socket()
+
+        onPhase("配置中文环境")
+        // Idempotent: existing images never got 1.4.0's locale/font/IBus setup.
+        runCatching { applyChineseEnvironment { msg -> Log.i(TAG, msg.trim()) } }
+            .onFailure { Log.w(TAG, "Chinese environment step failed", it) }
 
         if (!File(rootfsDir, "usr/bin/xclip").canExecute()) {
             Log.i(TAG, "Installing the chroot clipboard compatibility helper")
@@ -464,6 +479,8 @@ class ChrootRuntime(private val context: Context) {
         // even on rootfs images that were installed before this version.
         ensureGuestScripts()
 
+        onPhase("启动桌面会话")
+
         val runScript = """
             # Standard FHS PATH (inherited Android PATH lacks /usr/bin)
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -472,6 +489,9 @@ class ChrootRuntime(private val context: Context) {
             export TMPDIR=/tmp
             export HOME=/root
             export PREFIX=/usr
+            export LANG=zh_CN.UTF-8
+            export LC_ALL=zh_CN.UTF-8
+            export LANGUAGE=zh_CN:zh
             # This is a normal Ubuntu userspace, not the relocated native
             # Termux runtime.  Load only the glibc compatibility shim built
             # for this rooted Ubuntu filesystem.
@@ -544,8 +564,10 @@ if command -v ibus-daemon >/dev/null 2>&1; then
     ibus-daemon -drx >/tmp/droiddesk-ibus.log 2>&1 &
     sleep 1
     ibus engine libpinyin >/dev/null 2>&1 || true
-    command -v droiddesk-ime-watch >/dev/null 2>&1 && droiddesk-ime-watch >/dev/null 2>&1 &
 fi
+# The focus watcher only needs dbus-monitor; start it even when IBus is absent so an
+# older image still reports editable-focus changes (it keeps writing 0 otherwise).
+command -v droiddesk-ime-watch >/dev/null 2>&1 && droiddesk-ime-watch >/dev/null 2>&1 &
 exec ${'$'}DE_BIN
 SESSEOF
             chmod +x /tmp/droiddesk-session.sh
@@ -557,7 +579,8 @@ SESSEOF
         Log.i(TAG, "Starting chroot session for $desktopEnv")
 
         // Launch via ProcessBuilder through su so we get a Process handle we can monitor.
-        val su = rootShell.findSuPath() ?: return
+        val su = rootShell.findSuPath()
+            ?: throw IllegalStateException("未找到 su，无法以 root 启动桌面")
         val fullCommand = "chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(runScript)}"
         val startedSession = ProcessBuilder(su, "-c", fullCommand)
             .redirectErrorStream(true)
@@ -587,30 +610,30 @@ SESSEOF
 
     /** Wait until the chroot desktop shell has created its visible components. */
     fun waitForDesktopReady(desktopEnv: String = "xfce4", timeoutMs: Long = 45_000): Boolean {
-        val processes = when (desktopEnv) {
-            "lxqt" -> listOf("lxqt-session", "lxqt-panel")
-            "mate" -> listOf("mate-session", "mate-panel")
-            "kde" -> listOf("plasmashell")
-            else -> listOf("xfdesktop", "xfce4-panel")
+        val (required, alternatives) = when (desktopEnv) {
+            "lxqt" -> listOf("lxqt-panel") to listOf("lxqt-session")
+            "mate" -> listOf("mate-panel") to listOf("mate-session")
+            "kde" -> listOf("plasmashell") to emptyList()
+            else -> listOf("xfce4-panel") to listOf("xfdesktop", "xfwm4")
         }
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val check = processes.joinToString(" && ") { "pgrep -x '$it' >/dev/null" }
-            val output = runCatching {
-                rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(check)}")
-            }.getOrDefault("")
-            if (!output.contains("not found", ignoreCase = true) &&
-                processes.all { process ->
-                    runCatching {
-                        rootShell.exec(
-                            "chroot ${rootfsDir.absolutePath} /usr/bin/pgrep -x ${shellQuote(process)}",
-                        ).trim().isNotEmpty()
-                    }.getOrDefault(false)
-                }) {
+            val names = runCatching {
+                val command = "${getPreloadEnv()}export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
+                    "ps -A -o comm="
+                rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(command)}")
+                    .lines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+            }.getOrDefault(emptySet())
+            // xfdesktop can die while xfce4-panel and xfwm4 keep the desktop usable; a missing
+            // wallpaper must not turn into a 45 s "starting" screen on every launch.
+            if (required.all { it in names } && (alternatives.isEmpty() || alternatives.any { it in names })) {
                 Thread.sleep(650)
                 return true
             }
-            Thread.sleep(150)
+            Thread.sleep(400)
         }
         Log.w(TAG, "Timed out waiting for chroot $desktopEnv to paint its first desktop frame")
         return false
@@ -857,6 +880,75 @@ SESSEOF
     // ── Guest Chinese environment, desktop store, and package management ──
 
     /**
+     * Kills desktop processes a previous chroot session left behind.
+     *
+     * A surviving xfce4-session makes the next `startxfce4` exit immediately ("another
+     * session manager is already running"), which is why launches intermittently ended on
+     * the loading screen with no desktop at all.
+     */
+    fun cleanupStaleSession() {
+        if (!hasRoot()) return
+        runCatching {
+            rootShell.exec("pkill -9 -f 'android_intent_pipe' >/dev/null 2>&1 || true")
+            if (isRootfsReady()) {
+                execChroot(
+                    "pkill -9 -x xfce4-session; pkill -9 -x xfce4-panel; pkill -9 -x xfdesktop; " +
+                        "pkill -9 -x xfwm4; pkill -9 -x xfsettingsd; pkill -9 -x xfce4-power-manager; " +
+                        "pkill -9 -x xfce4-notifyd; pkill -9 -x xfconfd; pkill -9 -x pulseaudio; " +
+                        "rm -f /tmp/.xfsm-ICE-* /tmp/dbus-session 2>/dev/null; true",
+                )
+            }
+            Log.i(TAG, "Stale chroot session cleaned")
+        }.onFailure { Log.w(TAG, "Stale chroot cleanup failed: ${it.message}") }
+    }
+
+    /**
+     * Applies the Chinese desktop defaults to an *already installed* rootfs.
+     *
+     * 1.4.0 only configured this inside the install flow, so images installed by earlier
+     * releases kept an English XFCE. The heavy part (apt + locale-gen) runs once and is
+     * guarded by a marker; every launch only refreshes the two tiny locale files.
+     */
+    fun applyChineseEnvironment(onLog: (String) -> Unit = {}): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        return try {
+            ensureMounts()
+            val marker = File(rootfsDir, "var/lib/droiddesk-zh-v1")
+            val hasFonts = File(rootfsDir, "usr/share/fonts/truetype/noto").exists() ||
+                File(rootfsDir, "usr/share/fonts/opentype/noto").exists()
+            val hasIbus = File(rootfsDir, "usr/bin/ibus-daemon").exists()
+            val localeReady = execChroot(
+                "locale -a 2>/dev/null | grep -qi 'zh_CN.utf8'",
+            ) == 0
+            if (!marker.exists() || !hasFonts || !hasIbus || !localeReady) {
+                onLog(t("正在为已安装的 Ubuntu 应用中文环境…\n", "Applying Chinese environment to the installed Ubuntu...\n"))
+                ensureChineseEnvironment(onLog)
+                marker.writeText("v1")
+            } else {
+                execChroot(
+                    "printf '%s\\n' 'LANG=zh_CN.UTF-8' 'LANGUAGE=zh_CN:zh' 'LC_ALL=zh_CN.UTF-8' > /etc/default/locale; " +
+                        "mkdir -p /root; printf '%s\\n' 'export LANG=zh_CN.UTF-8' " +
+                        "'export LC_ALL=zh_CN.UTF-8' 'export LANGUAGE=zh_CN:zh' > /root/.xprofile",
+                    onLog,
+                )
+            }
+            DesktopLog.append(
+                context,
+                TAG,
+                "Chinese environment ensured (fonts=$hasFonts ibus=$hasIbus locale=$localeReady)",
+            )
+            onLog(t("中文环境已就绪（zh_CN.UTF-8）\n", "Chinese environment ready (zh_CN.UTF-8)\n"))
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "Chinese environment migration failed", e)
+            DesktopLog.append(context, TAG, "Chinese environment failed: ${e.message}")
+            onLog(t("中文环境应用失败：${e.message}\n", "Chinese environment failed: ${e.message}\n"))
+            false
+        }
+    }
+
+
+    /**
      * Installs the Chinese locale, CJK fonts, IBus with libpinyin, and the GTK runtime used
      * by the desktop store. Failures are reported but do not abort the whole DE install:
      * an English desktop is better than no desktop.
@@ -1049,15 +1141,24 @@ SESSEOF
         if (!hasRoot() || !isSafePackageName(packageName)) return false
         return try {
             ensureMounts()
+            // Keep the full apt output so a failure can be shown (and copied) verbatim
+            // instead of the useless "安装失败" toast the store used to produce.
+            val captured = StringBuilder()
+            val capture: (String) -> Unit = { chunk ->
+                captured.append(chunk)
+                if (captured.length > 64_000) captured.delete(0, captured.length - 48_000)
+                onLog(chunk)
+            }
             onProgress(0.05, t("正在更新软件包索引…", "Updating package index..."))
-            if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q", onLog) != 0) {
+            if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q", capture) != 0) {
                 onLog(t("软件包索引更新失败，尝试换源后重试…\n", "apt-get update failed; trying another mirror...\n"))
-                applyBestMirror(onLog)
+                applyBestMirror(capture)
+                execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q", capture)
             }
             onProgress(0.2, t("正在安装 $packageName…", "Installing $packageName..."))
             val first = execChroot(
                 "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${shellQuote(packageName)}",
-                onLog,
+                capture,
             )
             if (first == 0) {
                 onProgress(1.0, t("$packageName 安装完成", "$packageName installed"))
@@ -1065,13 +1166,30 @@ SESSEOF
             }
 
             onLog(t("安装失败（退出码 $first），正在自动修复依赖后重试…\n", "Install failed (exit $first); repairing and retrying...\n"))
-            repairPackageManager(onProgress, onLog)
+            diagnosePackageManager(capture)
+            repairPackageManager(onProgress, capture)
             val second = execChroot(
                 "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${shellQuote(packageName)}",
-                onLog,
+                capture,
             )
             val ok = second == 0
-            onProgress(if (ok) 1.0 else -1.0, if (ok) t("$packageName 安装完成", "$packageName installed") else t("$packageName 安装失败", "Failed to install $packageName"))
+            if (ok) {
+                onProgress(1.0, t("$packageName 安装完成", "$packageName installed"))
+            } else {
+                val tail = captured.lines()
+                    .filter { it.isNotBlank() }
+                    .takeLast(18)
+                    .joinToString("\n")
+                onLog("\n===== apt 输出（失败原文）=====\n$tail\n===== end =====\n")
+                DesktopLog.append(context, TAG, "install $packageName failed (exit $second):\n$tail")
+                onProgress(
+                    -1.0,
+                    t(
+                        "$packageName 安装失败（退出码 $second）\n\n$tail",
+                        "$packageName install failed (exit $second)\n\n$tail",
+                    ),
+                )
+            }
             ok
         } catch (error: Throwable) {
             Log.e(TAG, "Package install failed: $packageName", error)
@@ -1079,6 +1197,38 @@ SESSEOF
             onProgress(-1.0, "安装失败：${error.message}")
             false
         }
+    }
+
+    /**
+     * Read-only package-manager health check used when the store fails.
+     *
+     * Prints architecture, effective sources, DNS, dpkg locks, `dpkg --configure -a` and
+     * `apt-get update` results so the user can see (and copy) the real cause.
+     */
+    fun diagnosePackageManager(onLog: (String) -> Unit = {}) {
+        if (!hasRoot() || !isRootfsReady()) {
+            onLog("诊断：root 权限或 Ubuntu 镜像不可用\n")
+            return
+        }
+        val command = """
+            echo "[arch] ${'$'}(dpkg --print-architecture 2>&1)"
+            echo "[sources]"
+            grep -vE '^#|^$' /etc/apt/sources.list 2>/dev/null || true
+            ls /etc/apt/sources.list.d 2>/dev/null || true
+            echo "[resolv]"
+            cat /etc/resolv.conf 2>/dev/null || echo missing
+            echo "[locks]"
+            ls -l /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null || true
+            echo "[dpkg-configure]"
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/tmp/droiddesk-dpkg.log 2>&1
+            echo "exit=${'$'}?"
+            tail -n 20 /tmp/droiddesk-dpkg.log
+            echo "[apt-update]"
+            apt-get update -o Acquire::Retries=1 >/tmp/droiddesk-apt-update.log 2>&1
+            echo "exit=${'$'}?"
+            tail -n 20 /tmp/droiddesk-apt-update.log
+        """.trimIndent()
+        execChroot(command, onLog)
     }
 
     fun removePackage(

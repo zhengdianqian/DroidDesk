@@ -390,6 +390,34 @@ class AppState extends ChangeNotifier {
     await refreshDisplayInfo();
   }
 
+  /// Applies zh_CN locale, CJK fonts and IBus to an already-installed image.
+  Future<bool> applyChineseEnvironment() async {
+    final ok = await DroidDeskPlatform.applyChineseEnvironment();
+    await refreshDisplayInfo();
+    return ok;
+  }
+
+  /// Runs the apt/dpkg health report; the output is streamed into the package log card.
+  Future<void> diagnosePackageManager() async {
+    await DroidDeskPlatform.diagnosePackageManager();
+  }
+
+  /// A resolution/scale change only applies to a freshly built X server, so the
+  /// guest and the framebuffer are torn down before starting a new session.
+  Future<void> restartDesktopForDisplay() async {
+    if (!_isRunning) {
+      await refreshDisplayInfo();
+      return;
+    }
+    await DroidDeskPlatform.restartDesktopForDisplay();
+    _isRunning = false;
+    notifyListeners();
+    await refreshDisplayInfo();
+    await Future.delayed(const Duration(milliseconds: 1200));
+    await startLinux(mode: 'x11');
+    await refreshStatus();
+  }
+
   Future<Map<String, dynamic>> refreshPhantomStatus() async {
     try {
       _phantomStatus = await DroidDeskPlatform.getPhantomStatus();

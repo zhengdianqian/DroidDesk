@@ -874,6 +874,20 @@ class MainActivity : FlutterActivity() {
                                 result.success(true)
                             }
                         }
+                    } else if (chrootRuntime.isRootfsReady()) {
+                        // A ready Ubuntu image plus a denied/late root grant used to fall
+                        // through to the native runtime, which left a mix of stale desktop
+                        // processes behind and made every second launch fail. Fail loudly
+                        // with an actionable message instead of silently switching runtimes.
+                        Log.e(TAG, "Ubuntu rootfs exists but root is not available")
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "已安装的 Ubuntu 需要 root 权限：请在 KernelSU/Magisk 中允许 DroidDesk 获取 root，然后重试",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            result.success(false)
+                        }
                     } else {
                         // Non-root fallback: native Termux path
                         installThread("start-linux-native") {
@@ -907,7 +921,18 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "launchDesktopActivity" -> {
+                    // Same deterministic choice as startLinux: never flip runtimes silently.
                     val rooted = chrootRuntime.hasRoot()
+                    val rootedSession = rooted || chrootRuntime.isRootfsReady()
+                    if (rootedSession && !rooted) {
+                        Toast.makeText(
+                            this,
+                            "已安装的 Ubuntu 需要 root 权限，请在 KernelSU/Magisk 中授权后重试",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
                     // Flutter's "running" state can be stale (e.g. after Stop from the notification).
                     val running = if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()
                     if (!running) startForegroundService()
@@ -1074,6 +1099,25 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "diagnosePackageManager" -> {
+                    val messenger = flutterEngine.dartExecutor.binaryMessenger
+                    installThread("apt-diagnose") {
+                        val log: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(messenger, CHANNEL).invokeMethod(
+                                    "onPackageOperationLog", mapOf("text" to chunk),
+                                )
+                            }
+                        }
+                        if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
+                            chrootRuntime.diagnosePackageManager(log)
+                        } else {
+                            log("当前为 Termux 运行模式（无 root），不需要 Ubuntu 源诊断\n")
+                        }
+                        runOnUiThread { result.success(true) }
+                    }
+                }
+
                 "applyBestMirror" -> {
                     val messenger = flutterEngine.dartExecutor.binaryMessenger
                     installThread("apt-mirror") {
@@ -1091,6 +1135,54 @@ class MainActivity : FlutterActivity() {
                             false
                         }
                         runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "applyChineseEnvironment" -> {
+                    val messenger = flutterEngine.dartExecutor.binaryMessenger
+                    installThread("zh-migration") {
+                        val log: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(messenger, CHANNEL).invokeMethod(
+                                    "onPackageOperationLog", mapOf("text" to chunk),
+                                )
+                            }
+                        }
+                        val ok = when {
+                            chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady() ->
+                                chrootRuntime.applyChineseEnvironment(log)
+                            linuxRuntime.isBootstrapped() -> {
+                                linuxRuntime.applyChineseEnvironment(log)
+                                true
+                            }
+                            else -> false
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                // Resolution / scale changes only take effect once the X server is rebuilt,
+                // otherwise the old framebuffer keeps being stretched into the new surface.
+                "restartDesktopForDisplay" -> {
+                    val before = DisplayProfile.effectiveSize(this)
+                    thread(name = "display-restart") {
+                        if (chrootRuntime.isRunning()) chrootRuntime.stopSession()
+                        if (linuxRuntime.isRunning()) linuxRuntime.stopSession()
+                        stopService(Intent(this@MainActivity, X11ServerService::class.java))
+                        val after = DisplayProfile.effectiveSize(this)
+                        DesktopLog.append(
+                            this@MainActivity,
+                            TAG,
+                            "display change restart: ${before.x}x${before.y} -> ${after.x}x${after.y}",
+                        )
+                        runOnUiThread {
+                            result.success(
+                                mapOf(
+                                    "before" to "${before.x}x${before.y}",
+                                    "after" to "${after.x}x${after.y}",
+                                ),
+                            )
+                        }
                     }
                 }
 

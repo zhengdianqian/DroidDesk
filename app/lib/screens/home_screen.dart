@@ -696,26 +696,40 @@ class HomeScreen extends StatelessWidget {
                               ),
                             ],
                             selected: _resolutionOption(state),
-                            onSelected: (value) {
+                            onSelected: (value) async {
                               if (value.startsWith('device:')) {
-                                state.setDisplayProfile(
+                                await state.setDisplayProfile(
                                   resolutionMode: 'device',
                                   frameScale: double.tryParse(
                                     value.substring('device:'.length),
                                   ),
                                 );
                               } else {
-                                state.setDisplayProfile(resolutionMode: value);
+                                await state.setDisplayProfile(
+                                  resolutionMode: value,
+                                );
                               }
-                              ScaffoldMessenger.of(pageContext).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    AppStrings.t(
-                                      'settings.display.resolution.restart',
+                              if (!pageContext.mounted) return;
+                              if (state.isRunning) {
+                                ScaffoldMessenger.of(pageContext).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      '正在按新分辨率重启桌面会话…',
                                     ),
                                   ),
-                                ),
-                              );
+                                );
+                                await state.restartDesktopForDisplay();
+                              } else {
+                                ScaffoldMessenger.of(pageContext).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      AppStrings.t(
+                                        'settings.display.resolution.restart',
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }
                             },
                           );
                         },
@@ -861,6 +875,46 @@ class HomeScreen extends StatelessWidget {
                         onTap: () {
                           Navigator.pop(sheetContext);
                           state.repairPackageManager();
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.fact_check_rounded,
+                        color: DroidTheme.secondary,
+                        title: AppStrings.t('settings.apt.diagnose.title'),
+                        subtitle: AppStrings.t('settings.apt.diagnose.subtitle'),
+                        onTap: () async {
+                          Navigator.pop(sheetContext);
+                          await state.diagnosePackageManager();
+                          if (!pageContext.mounted) return;
+                          ScaffoldMessenger.of(pageContext).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppStrings.t('settings.apt.diagnose.started'),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.translate_rounded,
+                        color: const Color(0xFF34C759),
+                        title: AppStrings.t('settings.zh.title'),
+                        subtitle: AppStrings.t('settings.zh.subtitle'),
+                        onTap: () async {
+                          Navigator.pop(sheetContext);
+                          final ok = await state.applyChineseEnvironment();
+                          if (!pageContext.mounted) return;
+                          ScaffoldMessenger.of(pageContext).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppStrings.t(
+                                  ok
+                                      ? 'settings.zh.ok'
+                                      : 'settings.zh.failed',
+                                ),
+                              ),
+                            ),
+                          );
                         },
                       ),
                       _SettingsRow(

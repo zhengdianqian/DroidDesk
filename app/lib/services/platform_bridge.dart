@@ -477,6 +477,26 @@ class DroidDeskPlatform {
     return await _channel.invokeMethod<bool>('applyBestMirror') ?? false;
   }
 
+  /// Prints the guest package-manager health report (arch, sources, DNS, locks,
+  /// `dpkg --configure -a` and `apt-get update` results) to the log stream.
+  static Future<bool> diagnosePackageManager() async {
+    return await _channel.invokeMethod<bool>('diagnosePackageManager') ?? false;
+  }
+
+  /// Idempotently applies zh_CN locale, CJK fonts and IBus to an installed image.
+  static Future<bool> applyChineseEnvironment() async {
+    return await _channel.invokeMethod<bool>('applyChineseEnvironment') ?? false;
+  }
+
+  /// Stops the guest and the X server so the next launch uses the new framebuffer
+  /// size. Returns the effective size before/after the change for the log.
+  static Future<Map<String, dynamic>> restartDesktopForDisplay() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'restartDesktopForDisplay',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
+
   /// Opens the Android file picker, then installs the chosen .deb in the guest.
   static Future<Map<String, dynamic>> pickDebPackage() async {
     final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(

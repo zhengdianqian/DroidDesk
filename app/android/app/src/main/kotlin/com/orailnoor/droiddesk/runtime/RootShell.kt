@@ -15,6 +15,8 @@ class RootShell(private val context: Context) {
     companion object {
         private const val TAG = "RootShell"
 
+        private const val ROOT_CHECK_TIMEOUT_MS = 8_000L
+
         // Common su paths, ordered by likelihood
         private val SU_PATHS = listOf(
             "/system/xbin/su",
@@ -72,7 +74,10 @@ class RootShell(private val context: Context) {
     fun hasRoot(): Boolean {
         cachedRootState?.let { return it }
         val su = findSuPath() ?: return false
-        val result = execSync(su, "id -u")
+        // Never block the caller forever: KernelSU/Magisk can show a permission
+        // dialog (or simply stall) and an unbounded wait leaves the app stuck on
+        // the loading screen with no clue.
+        val result = execSync(su, "id -u", ROOT_CHECK_TIMEOUT_MS)
         val hasRoot = result.trim() == "0"
         cachedRootState = hasRoot
         Log.i(TAG, "Root check: $hasRoot (su=$su)")
@@ -110,14 +115,22 @@ class RootShell(private val context: Context) {
         cachedRootState = null
     }
 
-    private fun execSync(su: String, command: String): String {
+    private fun execSync(su: String, command: String, timeoutMs: Long = 0): String {
         Log.d(TAG, "su exec: $command")
         val process = ProcessBuilder(su, "-c", command)
             .redirectErrorStream(true)
             .start()
 
         val output = process.inputStream.bufferedReader().readText()
-        process.waitFor()
+        if (timeoutMs > 0) {
+            if (!process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "su command timed out after ${timeoutMs}ms: $command")
+                process.destroyForcibly()
+                return ""
+            }
+        } else {
+            process.waitFor()
+        }
         return output
     }
 

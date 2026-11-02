@@ -125,6 +125,86 @@ class LinuxRuntime(private val context: Context) {
         return sessionProcess?.isAlive == true
     }
 
+    /**
+     * Kills guest processes a previous session left behind.
+     *
+     * DesktopActivity can be destroyed (recents swipe, low-memory) while xfce4-session keeps
+     * running. A stale session manager then refuses to start a new one ("another session
+     * manager is already running") which is the main reason a launch ended on the loading
+     * screen. Cheap: a few pkill calls through the app's own shell, no root required.
+     */
+    fun cleanupStaleSession() {
+        val leftovers = listOf(
+            "xfce4-session", "xfce4-panel", "xfdesktop", "xfwm4", "xfsettingsd",
+            "xfce4-power-manager", "xfce4-notifyd", "xfconfd", "pulseaudio",
+        )
+        val script = buildString {
+            leftovers.forEach { append("pkill -9 -x '$it' >/dev/null 2>&1 || true\n") }
+            append("pkill -9 -f 'android_intent_pipe' >/dev/null 2>&1 || true\n")
+            append("rm -f \"${tmpDir.absolutePath}/dbus-session\"\n")
+            append("rm -f \"${tmpDir.absolutePath}\"/.xfsm-ICE-* 2>/dev/null || true\n")
+        }
+        runCatching {
+            ProcessBuilder(File(binDir, "bash").absolutePath, "-c", script)
+                .redirectErrorStream(true)
+                .also { builder ->
+                    builder.environment().clear()
+                    builder.environment().putAll(getTermuxEnv())
+                }
+                .start()
+                .waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
+        }.onFailure { Log.w(TAG, "Stale session cleanup failed: ${it.message}") }
+    }
+
+    /**
+     * Idempotent environment preparation: the expensive migrations already carry their own
+     * markers, so a launch on an installed image only pays for a handful of file checks.
+     */
+    private fun prepareSessionEnvironment(onPhase: (String) -> Unit) {
+        val stamp = "${File(prefixDir, "var/lib/dpkg/status").lastModified()}-" +
+            File(binDir, "bash").lastModified()
+        val marker = File(baseDir, ".session_prepared")
+        if (!marker.exists() || marker.readTextOrNull() != stamp) {
+            onPhase("整理 Linux 运行环境（首次启动较慢）")
+            patchShebangs()
+            patchElfRunpaths(prefixDir)
+            compileSocketHook()
+            patchEmbeddedXfcePaths()
+            marker.writeText(stamp)
+        }
+        applyChineseEnvironment(onPhase)
+    }
+
+    /**
+     * Existing images were installed before the Chinese defaults existed, so this runs on
+     * every launch (fast path: two tiny file writes) and only touches the network when a
+     * CJK font is genuinely missing.
+     */
+    fun applyChineseEnvironment(onLog: (String) -> Unit = {}) {
+        runCatching {
+            homeDir.mkdirs()
+            val xprofile = File(homeDir, ".xprofile")
+            val wanted = """
+                export LANG=zh_CN.UTF-8
+                export LC_ALL=zh_CN.UTF-8
+                export LANGUAGE=zh_CN:zh
+            """.trimIndent()
+            val existing = if (xprofile.exists()) xprofile.readText() else ""
+            if (!existing.contains("LANG=zh_CN.UTF-8")) {
+                xprofile.appendText((if (existing.isBlank()) "" else "\n") + wanted + "\n")
+            }
+            val profile = File(homeDir, ".profile")
+            if (!profile.exists() || !profile.readText().contains("LANG=zh_CN.UTF-8")) {
+                profile.appendText("\n$wanted\n")
+            }
+            onLog("已写入中文环境变量（LANG=zh_CN.UTF-8）")
+            DesktopLog.append(context, TAG, "Chinese environment applied to native runtime")
+        }.onFailure {
+            Log.w(TAG, "Failed to write Chinese environment: ${it.message}")
+            onLog("写入中文环境变量失败：${it.message}")
+        }
+    }
+
     fun getInstalledDE(): String {
         val marker = File(prefixDir, DE_MARKER)
         if (marker.exists()) return marker.readText().trim().ifEmpty { "xfce4" }
@@ -1089,7 +1169,11 @@ class LinuxRuntime(private val context: Context) {
         env["SHELL"] = File(binDir, "bash").absolutePath
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
-        env["LANG"] = "en_US.UTF-8"
+        // The product ships a Chinese desktop. Older sessions exported en_US here, which is
+        // why an already-installed image stayed English even after the app was localized.
+        env["LANG"] = "zh_CN.UTF-8"
+        env["LC_ALL"] = "zh_CN.UTF-8"
+        env["LANGUAGE"] = "zh_CN:zh"
 
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = tmpDir.absolutePath
@@ -1930,8 +2014,16 @@ class LinuxRuntime(private val context: Context) {
 
     // ── Session Management ──
 
-    fun startSession(desktopEnv: String = "xfce4", mode: String = "x11", width: Int = 1920, height: Int = 1080) {
+    fun startSession(
+        desktopEnv: String = "xfce4",
+        mode: String = "x11",
+        width: Int = 1920,
+        height: Int = 1080,
+        onPhase: (String) -> Unit = {},
+    ) {
         val selectedDesktop = normalizedDesktop(desktopEnv)
+        onPhase("检查 Linux 运行环境")
+        DesktopLog.append(context, TAG, "native session start requested (${width}x$height)")
         extractBootstrapIfNeeded(context)
 
         if (isRunning()) {
@@ -1940,28 +2032,27 @@ class LinuxRuntime(private val context: Context) {
         }
 
         if (!isBootstrapped()) {
-            Log.e(TAG, "Cannot start session — not bootstrapped")
-            return
+            throw IllegalStateException("Linux 运行环境未安装完成（缺少 bootstrap），请先在设置中重新安装")
         }
 
-        patchShebangs()
-        patchElfRunpaths(prefixDir)
-        compileSocketHook()
-        patchEmbeddedXfcePaths()
+        onPhase("清理上次会话残留")
+        cleanupStaleSession()
+        prepareSessionEnvironment(onPhase)
 
         // Packages whose maintainer scripts failed on older releases stay half-configured and
         // block every later apt install (and with it the Adreno driver). Finish them once
         // their scripts have been relocated.
         if (hasUnfinishedPackages()) {
+            onPhase("修复上次中断的软件包")
             Log.i(TAG, "Finishing packages left half-configured by an earlier install")
             installPackageGroup("dpkg --configure -a")
         }
 
+        onPhase("检查图形运行时")
         // Repair installations made by older releases, where mesa-zink could
         // remove Mesa and leave the configured llvmpipe fallback unavailable.
         if (!ensureGraphicsPackages()) {
-            Log.e(TAG, "Cannot start desktop without a working Mesa runtime")
-            return
+            throw IllegalStateException("图形运行时不可用（Mesa 缺失且安装失败），请检查网络后重试")
         }
 
         val clipboardTool = File(binDir, "xclip")
@@ -1975,6 +2066,7 @@ class LinuxRuntime(private val context: Context) {
         }
 
         if (selectedDesktop == "xfce4") {
+            onPhase("应用桌面配置")
             // Older installs predate the auto-maximize helper; try once while upgrading the profile.
             if (XfceMobileProfile.needsInstall(homeDir) && !File(binDir, "devilspie2").canExecute()) {
                 Log.i(TAG, "Installing the window fitting helper")
@@ -2001,6 +2093,8 @@ class LinuxRuntime(private val context: Context) {
 
         // X11ServerService owns this socket. Never delete it from the client runtime.
         File(tmpDir, ".X11-unix").mkdirs()
+
+        onPhase("启动会话总线")
 
         // Remove stale Xfce ICE listeners left by a killed/restarted activity.
         tmpDir.listFiles { file -> file.name.startsWith(".xfsm-ICE-") }
@@ -2070,9 +2164,10 @@ class LinuxRuntime(private val context: Context) {
             Log.i(TAG, "Session dbus-daemon ready")
         } catch (e: Exception) {
             Log.e(TAG, "dbus-daemon start failed: ${e.message}")
+            DesktopLog.append(context, TAG, "dbus-daemon start failed: ${e.message}")
             dbusProcess?.destroyForcibly()
             dbusProcess = null
-            return
+            throw IllegalStateException("会话总线（dbus）启动失败：${e.message}", e)
         }
 
         // The Termux startxfce4 wrapper falls back to Android's /bin/sh when an
@@ -2125,7 +2220,9 @@ class LinuxRuntime(private val context: Context) {
             exec $desktopCommand
         """.trimIndent()
 
+        onPhase("启动桌面会话")
         Log.i(TAG, "Starting native Termux session for $selectedDesktop")
+        DesktopLog.append(context, TAG, "native session launching $desktopCommand")
 
         val bashBin = File(prefixDir, "bin/bash").absolutePath
         val command = listOf(bashBin, "-c", runScript)
@@ -2147,6 +2244,7 @@ class LinuxRuntime(private val context: Context) {
                 var charsRead: Int
                 while (reader.read(buffer).also { charsRead = it } != -1) {
                     Log.d(TAG, "DESKTOP: " + String(buffer, 0, charsRead))
+                    DesktopLog.append(context, "desktop", String(buffer, 0, charsRead))
                 }
             } catch (error: java.io.IOException) {
                 // destroyForcibly() closes the pipe during a normal shutdown.
@@ -2159,17 +2257,12 @@ class LinuxRuntime(private val context: Context) {
 
     /** Wait until the desktop shell processes that paint the first frame exist. */
     fun waitForDesktopReady(desktopEnv: String = "xfce4", timeoutMs: Long = 45_000): Boolean {
-        val processes = when (normalizedDesktop(desktopEnv)) {
-            "lxqt" -> listOf("lxqt-session", "lxqt-panel")
-            "mate" -> listOf("mate-session", "mate-panel")
-            "kde" -> listOf("plasmashell")
-            else -> listOf("xfdesktop", "xfce4-panel")
-        }
+        val (required, alternatives) = desktopReadinessChecks(normalizedDesktop(desktopEnv))
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val check = processes.joinToString(" && ") { "pgrep -x '$it' >/dev/null" }
-            val ready = runCatching {
-                ProcessBuilder(File(binDir, "bash").absolutePath, "-c", check)
+            val names = runCatching {
+                val check = "ps -A -o comm= 2>/dev/null"
+                val output = ProcessBuilder(File(binDir, "bash").absolutePath, "-c", check)
                     .directory(homeDir)
                     .redirectErrorStream(true)
                     .also { builder ->
@@ -2177,16 +2270,26 @@ class LinuxRuntime(private val context: Context) {
                         builder.environment().putAll(getTermuxEnv())
                     }
                     .start()
-                    .waitFor() == 0
-            }.getOrDefault(false)
-            if (ready) {
+                    .inputStream.bufferedReader().readText()
+                output.lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            }.getOrDefault(emptySet())
+            // A desktop without xfdesktop (e.g. after a wallpaper crash) is still usable;
+            // waiting the full timeout for it wasted 45 s on every launch.
+            if (required.all { it in names } && (alternatives.isEmpty() || alternatives.any { it in names })) {
                 Thread.sleep(650)
                 return true
             }
-            Thread.sleep(150)
+            Thread.sleep(350)
         }
         Log.w(TAG, "Timed out waiting for $desktopEnv to paint its first desktop frame")
         return false
+    }
+
+    private fun desktopReadinessChecks(desktop: String): Pair<List<String>, List<String>> = when (desktop) {
+        "lxqt" -> listOf("lxqt-panel") to listOf("lxqt-session")
+        "mate" -> listOf("mate-panel") to listOf("mate-session")
+        "kde" -> listOf("plasmashell") to emptyList()
+        else -> listOf("xfce4-panel") to listOf("xfdesktop", "xfwm4")
     }
 
     fun stopSession() {
@@ -2198,6 +2301,9 @@ class LinuxRuntime(private val context: Context) {
         sessionProcess = null
         dbusProcess?.destroyForcibly()
         dbusProcess = null
+        // A killed session manager often leaves panels/wm alive; the next launch would
+        // attach to those zombies instead of painting a fresh desktop.
+        cleanupStaleSession()
         Log.i(TAG, "Session stopped")
     }
 
