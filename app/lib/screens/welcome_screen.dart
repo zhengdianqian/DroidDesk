@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/screens/setup/setup_progress.dart';
 import 'package:droiddesk/state/app_state.dart';
@@ -30,8 +31,8 @@ class WelcomeScreen extends StatelessWidget {
                   child: IconButton(
                     onPressed: () => state.toggleThemeMode(),
                     tooltip: state.isDarkMode
-                        ? 'Switch to Light Theme'
-                        : 'Switch to Dark Theme',
+                        ? AppStrings.t('theme.switchToLight')
+                        : AppStrings.t('theme.switchToDark'),
                     icon: Icon(
                       state.isDarkMode
                           ? Icons.light_mode_rounded
@@ -70,7 +71,7 @@ class WelcomeScreen extends StatelessWidget {
                     ),
                 const SizedBox(height: 34),
                 Text(
-                      'Your desktop.\nNow on Android.',
+                      AppStrings.t('welcome.title'),
                       style: DroidTheme.headingXl,
                     )
                     .animate()
@@ -78,23 +79,23 @@ class WelcomeScreen extends StatelessWidget {
                     .slideY(begin: 0.08, curve: Curves.easeOutCubic),
                 const SizedBox(height: 18),
                 Text(
-                  'A complete Desktop Environment that runs locally on your phone.',
+                  AppStrings.t('welcome.subtitle'),
                   style: DroidTheme.bodyLg,
                 ).animate().fadeIn(delay: 180.ms, duration: 450.ms),
                 const SizedBox(height: 28),
                 _Feature(
                   icon: Icons.lock_outline_rounded,
-                  text: 'Private and local',
+                  text: AppStrings.t('welcome.feature.private'),
                 ),
                 const SizedBox(height: 14),
                 _Feature(
                   icon: Icons.bolt_rounded,
-                  text: 'Optimized for your GPU',
+                  text: AppStrings.t('welcome.feature.gpu'),
                 ),
                 const SizedBox(height: 14),
                 _Feature(
                   icon: Icons.desktop_mac_outlined,
-                  text: 'Desktop Environment, ready to work',
+                  text: AppStrings.t('welcome.feature.desktop'),
                 ),
                 const Spacer(flex: 4),
                 SizedBox(
@@ -105,12 +106,12 @@ class WelcomeScreen extends StatelessWidget {
                         builder: (_) => const SetupProgressScreen(),
                       ),
                     ),
-                    child: const Row(
+                    child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Text('Set Up Desktop Environment'),
-                        SizedBox(width: 8),
-                        Icon(Icons.arrow_forward_rounded, size: 19),
+                        Text(AppStrings.t('welcome.setup')),
+                        const SizedBox(width: 8),
+                        const Icon(Icons.arrow_forward_rounded, size: 19),
                       ],
                     ),
                   ),
@@ -118,7 +119,7 @@ class WelcomeScreen extends StatelessWidget {
                 const SizedBox(height: 14),
                 Center(
                   child: Text(
-                    'Ubuntu tools · Desktop Environment',
+                    AppStrings.t('welcome.footer'),
                     style: DroidTheme.bodySm,
                   ),
                 ),

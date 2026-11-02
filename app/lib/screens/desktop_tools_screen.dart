@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/widgets/droid_ui.dart';
@@ -58,7 +59,13 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
     if (!mounted) return;
     setState(() => _dockBusy = false);
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(saved ? 'Dock updated' : 'Could not update dock')),
+      SnackBar(
+        content: Text(
+          saved
+              ? AppStrings.t('tools.dockUpdated')
+              : AppStrings.t('tools.dockUpdateFailed'),
+        ),
+      ),
     );
   }
 
@@ -74,14 +81,18 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
       await _loadSnapshots();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Desktop snapshot created')),
+          SnackBar(content: Text(AppStrings.t('tools.snapshotCreated'))),
         );
       }
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Snapshot failed: $error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppStrings.t('tools.snapshotFailed', args: {'error': '$error'}),
+            ),
+          ),
+        );
       }
     } finally {
       if (mounted) setState(() => _snapshotBusy = false);
@@ -92,18 +103,16 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Restore this snapshot?'),
-        content: const Text(
-          'The Linux session will stop. Current home files and settings will be replaced, and missing packages will be restored.',
-        ),
+        title: Text(AppStrings.t('tools.restoreDialog.title')),
+        content: Text(AppStrings.t('tools.restoreDialog.body')),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            child: Text(AppStrings.t('common.cancel')),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Restore'),
+            child: Text(AppStrings.t('tools.restore')),
           ),
         ],
       ),
@@ -115,15 +124,24 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(restored ? 'Snapshot restored' : 'Restore failed'),
+            content: Text(
+              restored
+                  ? AppStrings.t('tools.restored')
+                  : AppStrings.t('tools.restoreFailed'),
+            ),
           ),
         );
       }
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Restore failed: $error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppStrings.t('tools.restoreFailedError',
+                  args: {'error': '$error'}),
+            ),
+          ),
+        );
       }
     } finally {
       if (mounted) setState(() => _snapshotBusy = false);
@@ -134,17 +152,17 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete snapshot?'),
+        title: Text(AppStrings.t('tools.deleteDialog.title')),
         content: Text(name),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            child: Text(AppStrings.t('common.cancel')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
             style: TextButton.styleFrom(foregroundColor: DroidTheme.error),
-            child: const Text('Delete'),
+            child: Text(AppStrings.t('common.delete')),
           ),
         ],
       ),
@@ -165,13 +183,16 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               DroidPageHeader(
-                title: 'Desktop Tools',
-                subtitle: 'Dock apps and desktop backups',
+                title: AppStrings.t('tools.title'),
+                subtitle: AppStrings.t('tools.subtitle'),
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
                 child: DroidSegmentedTabs(
-                  labels: const ['Dock', 'Backups'],
+                  labels: [
+                    AppStrings.t('tools.tab.dock'),
+                    AppStrings.t('tools.tab.backups'),
+                  ],
                   icons: const [
                     Icons.space_dashboard_rounded,
                     Icons.history_rounded,
@@ -222,7 +243,7 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
       children: [
         Row(
           children: [
-            DroidSectionLabel('Pinned to dock'),
+            DroidSectionLabel(AppStrings.t('tools.pinnedToDock')),
             const Spacer(),
             if (_dockBusy)
               const Padding(
@@ -240,8 +261,8 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
         if (_dockPackages.isEmpty)
           DroidEmptyCard(
             icon: Icons.push_pin_outlined,
-            title: 'No apps pinned',
-            subtitle: 'Add Android apps below to launch them from the Linux dock.',
+            title: AppStrings.t('tools.emptyDock.title'),
+            subtitle: AppStrings.t('tools.emptyDock.subtitle'),
           )
         else
           DroidGroupCard(
@@ -287,7 +308,7 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                       trailing: _RoundIconButton(
                         icon: Icons.close_rounded,
                         color: DroidTheme.error,
-                        tooltip: 'Remove from dock',
+                        tooltip: AppStrings.t('tools.removeFromDock'),
                         onTap: _dockBusy
                             ? null
                             : () => _saveDock([..._dockPackages]..remove(package)),
@@ -299,17 +320,17 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
             ),
           ),
         const SizedBox(height: 28),
-        DroidSectionLabel('Add an Android app'),
+        DroidSectionLabel(AppStrings.t('tools.addAndroidApp')),
         const SizedBox(height: 10),
         DroidSearchField(
           controller: _dockSearchController,
-          hint: 'Search installed apps',
+          hint: AppStrings.t('tools.searchInstalledApps'),
           onChanged: (_) => setState(() {}),
         ),
         if (dockFull) ...[
           const SizedBox(height: 10),
           Text(
-            'The dock is full. Remove an app to add another.',
+            AppStrings.t('tools.dockFull'),
             style: DroidTheme.bodySm.copyWith(color: DroidTheme.warning),
           ),
         ],
@@ -317,10 +338,10 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
         if (available.isEmpty)
           DroidEmptyCard(
             icon: Icons.search_off_rounded,
-            title: 'No matching apps',
+            title: AppStrings.t('tools.emptyApps.title'),
             subtitle: query.isEmpty
-                ? 'Every installed app is already pinned.'
-                : 'Try a different name.',
+                ? AppStrings.t('tools.emptyApps.allPinned')
+                : AppStrings.t('tools.emptyApps.tryOther'),
           )
         else
           DroidGroupCard(
@@ -334,7 +355,7 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                     trailing: _RoundIconButton(
                       icon: Icons.add_rounded,
                       color: DroidTheme.primary,
-                      tooltip: 'Add to dock',
+                      tooltip: AppStrings.t('tools.addToDock'),
                       onTap: _dockBusy || dockFull
                           ? null
                           : () => _saveDock([
@@ -369,10 +390,13 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Desktop snapshot', style: DroidTheme.headingSm),
+                          Text(
+                            AppStrings.t('tools.snapshotCard.title'),
+                            style: DroidTheme.headingSm,
+                          ),
                           const SizedBox(height: 2),
                           Text(
-                            'Home files, desktop settings, wallpaper and installed packages',
+                            AppStrings.t('tools.snapshotCard.subtitle'),
                             style: DroidTheme.bodySm,
                           ),
                         ],
@@ -395,7 +419,11 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                             ),
                           )
                         : const Icon(Icons.add_rounded),
-                    label: Text(_snapshotBusy ? 'Working…' : 'Create snapshot'),
+                    label: Text(
+                      _snapshotBusy
+                          ? AppStrings.t('tools.working')
+                          : AppStrings.t('tools.createSnapshot'),
+                    ),
                   ),
                 ),
               ],
@@ -405,7 +433,7 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
         const SizedBox(height: 28),
         Row(
           children: [
-            DroidSectionLabel('Snapshots'),
+            DroidSectionLabel(AppStrings.t('tools.snapshots')),
             const Spacer(),
             if (_snapshots.isNotEmpty)
               Text('${_snapshots.length}', style: DroidTheme.bodySm),
@@ -415,8 +443,8 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
         if (_snapshots.isEmpty)
           DroidEmptyCard(
             icon: Icons.inventory_2_outlined,
-            title: 'No snapshots yet',
-            subtitle: 'Create one before big changes so you can roll back.',
+            title: AppStrings.t('tools.emptySnapshots.title'),
+            subtitle: AppStrings.t('tools.emptySnapshots.subtitle'),
           )
         else
           DroidGroupCard(
@@ -476,17 +504,20 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                   children: [
                     Icon(Icons.restore_rounded, size: 18, color: DroidTheme.textPrimary),
                     const SizedBox(width: 10),
-                    const Text('Restore'),
+                    Text(AppStrings.t('tools.restore')),
                   ],
                 ),
               ),
-              const PopupMenuItem(
+              PopupMenuItem(
                 value: 'delete',
                 child: Row(
                   children: [
-                    Icon(Icons.delete_outline_rounded, size: 18, color: DroidTheme.error),
-                    SizedBox(width: 10),
-                    Text('Delete', style: TextStyle(color: DroidTheme.error)),
+                    const Icon(Icons.delete_outline_rounded, size: 18, color: DroidTheme.error),
+                    const SizedBox(width: 10),
+                    Text(
+                      AppStrings.t('common.delete'),
+                      style: const TextStyle(color: DroidTheme.error),
+                    ),
                   ],
                 ),
               ),
@@ -504,6 +535,9 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
     ];
     final hour = date.hour.toString().padLeft(2, '0');
     final minute = date.minute.toString().padLeft(2, '0');
+    if (AppStrings.isZh) {
+      return '${date.year}年${date.month}月${date.day}日 $hour:$minute';
+    }
     return '${date.day} ${months[date.month - 1]} ${date.year}, $hour:$minute';
   }
 
@@ -557,7 +591,10 @@ class _CountPill extends StatelessWidget {
         borderRadius: BorderRadius.circular(20),
       ),
       child: Text(
-        '$count of $max',
+        AppStrings.t('tools.countOfMax', args: {
+          'count': '$count',
+          'max': '$max',
+        }),
         style: DroidTheme.label.copyWith(color: color, letterSpacing: 0.1),
       ),
     );

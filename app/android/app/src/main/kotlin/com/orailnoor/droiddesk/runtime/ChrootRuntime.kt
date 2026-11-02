@@ -32,6 +32,9 @@ class ChrootRuntime(private val context: Context) {
     private val rootShell = RootShell(context)
     private val rootfsManager = RootfsManager(context)
 
+    /** Localized text for install progress / log lines. */
+    private fun t(zh: String, en: String): String = L10n.tr(context, zh, en)
+
     private val baseDir: File get() = context.filesDir
     private val rootfsDir: File get() = File(baseDir, "rootfs")
     private val tmpDir: File get() = File(baseDir, "tmp")
@@ -156,6 +159,7 @@ class ChrootRuntime(private val context: Context) {
             "Acquire::Retries \"3\";\n" +
                     "Acquire::http::Timeout \"30\";\n" +
                     "Acquire::https::Timeout \"30\";\n" +
+                    "Acquire::ForceIPv4 \"true\";\n" +
                     "DPkg::Lock::Timeout \"60\";\n"
         )
 
@@ -181,16 +185,16 @@ class ChrootRuntime(private val context: Context) {
 
         thread(name = "chroot-de-install") {
             try {
-                onProgress(0.0, "Mounting rootfs...")
+                onProgress(0.0, t("正在挂载 rootfs…", "Mounting rootfs..."))
                 ensureMounts()
 
-                onProgress(0.05, "Fixing Android network permissions...")
+                onProgress(0.05, t("正在修复 Android 网络权限…", "Fixing Android network permissions..."))
                 execChroot("groupadd -g 3003 inet 2>/dev/null || true; usermod -a -G inet _apt 2>/dev/null || true; usermod -a -G inet root 2>/dev/null || true", onLog)
 
-                onProgress(0.05, "Repairing interrupted packages...")
+                onProgress(0.05, t("正在修复中断的软件包…", "Repairing interrupted packages..."))
                 execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
 
-                onProgress(0.05, "Selecting fastest APT mirror...")
+                onProgress(0.05, t("正在探测最快的 APT 镜像…", "Selecting fastest APT mirror..."))
                 val codename = MirrorSelector.detectCodename(rootfsDir)
                 val mirrors = MirrorSelector.probeReachable(codename)
                 var aptUpdated = false
@@ -199,25 +203,32 @@ class ChrootRuntime(private val context: Context) {
                     aptUpdated = execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0
                 } else {
                     for (mirror in mirrors) {
-                        onLog("Using APT mirror $mirror ($codename, arm64)\n")
+                        onLog(t("正在使用 APT 镜像 $mirror（$codename，arm64）\n", "Using APT mirror $mirror ($codename, arm64)\n"))
                         MirrorSelector.writeSources(rootfsDir, mirror, codename)
                         if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0) {
                             aptUpdated = true
                             break
                         }
-                        onLog("apt-get update failed through $mirror, trying next mirror...\n")
+                        onLog(t("通过 $mirror 更新索引失败，正在尝试下一个镜像…\n", "apt-get update failed through $mirror, trying next mirror...\n"))
+                        // A DNS failure inside the chroot looks exactly like this;
+                        // refresh resolv.conf and re-pin mirror IPs before retrying.
+                        try {
+                            DnsConfig.applyTo(rootfsDir, rootShell, L10n.isChinese(context)) { onLog(it) }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "DNS refresh during failover failed: ${e.message}")
+                        }
                     }
                 }
                 if (!aptUpdated) {
-                    throw IllegalStateException("Package index update failed (all mirrors unreachable)")
+                    throw IllegalStateException(t("软件包索引更新失败（所有镜像均不可用）", "Package index update failed (all mirrors unreachable)"))
                 }
 
-                onProgress(0.1, "Installing Android kernel compatibility...")
+                onProgress(0.1, t("正在安装 Android 内核兼容组件…", "Installing Android kernel compatibility..."))
                 if (!ensureCloseRangeCompatibility(onLog)) {
-                    throw IllegalStateException("Android kernel compatibility setup failed")
+                    throw IllegalStateException(t("Android 内核兼容组件安装失败", "Android kernel compatibility setup failed"))
                 }
 
-                onProgress(0.15, "Installing core tools...")
+                onProgress(0.15, t("正在安装基础工具…", "Installing core tools..."))
                 if (!isPackageInstalled("x11-utils")) {
                     if (execChroot(
                         "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
@@ -225,11 +236,11 @@ class ChrootRuntime(private val context: Context) {
                         onLog
                     ) != 0) {
                         execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
-                        if (!isPackageInstalled("x11-utils")) throw IllegalStateException("Core package installation failed")
+                        if (!isPackageInstalled("x11-utils")) throw IllegalStateException(t("基础工具安装失败", "Core package installation failed"))
                     }
                 }
 
-                onProgress(0.2, "Installing Mesa GPU drivers...")
+                onProgress(0.2, t("正在安装 Mesa GPU 驱动…", "Installing Mesa GPU drivers..."))
                 if (!isPackageInstalled("mesa-vulkan-drivers")) {
                     if (execChroot(
                         "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
@@ -241,7 +252,7 @@ class ChrootRuntime(private val context: Context) {
                     }
                 }
 
-                onProgress(0.4, "Installing desktop environment...")
+                onProgress(0.4, t("正在安装桌面环境…", "Installing desktop environment..."))
                 val checkPkg = when (desktopEnv) {
                     "lxqt" -> "lxqt"
                     "mate" -> "mate-desktop-environment"
@@ -260,11 +271,11 @@ class ChrootRuntime(private val context: Context) {
                         onLog
                     ) != 0) {
                         execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
-                        if (!isPackageInstalled(checkPkg)) throw IllegalStateException("Desktop package installation failed")
+                        if (!isPackageInstalled(checkPkg)) throw IllegalStateException(t("桌面环境安装失败", "Desktop package installation failed"))
                     }
                 }
 
-                onProgress(0.6, "Installing HiDPI icon theme...")
+                onProgress(0.6, t("正在安装高清图标主题…", "Installing HiDPI icon theme..."))
                 if (!isPackageInstalled("papirus-icon-theme")) {
                     if (execChroot(
                         "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
@@ -276,7 +287,7 @@ class ChrootRuntime(private val context: Context) {
                     }
                 }
 
-                onProgress(0.8, "Installing Desktop Essentials tools...")
+                onProgress(0.8, t("正在安装桌面常用软件…", "Installing Desktop Essentials tools..."))
                 if (!isPackageInstalled("htop")) {
                     val essentialsExit = execChroot(
                         "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
@@ -285,19 +296,19 @@ class ChrootRuntime(private val context: Context) {
                     )
                     if (essentialsExit != 0) {
                         execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
-                        if (!isPackageInstalled("htop")) throw IllegalStateException("Desktop Essentials package installation failed")
+                        if (!isPackageInstalled("htop")) throw IllegalStateException(t("桌面常用软件包安装失败", "Desktop Essentials package installation failed"))
                     }
                 }
 
-                onProgress(0.9, "Cleaning up...")
+                onProgress(0.9, t("正在清理缓存…", "Cleaning up..."))
                 execChroot("apt-get clean", onLog)
 
                 File(rootfsDir, CHROOT_DE_MARKER).writeText("$desktopEnv\n")
-                onProgress(1.0, "$desktopEnv installed in chroot")
+                onProgress(1.0, t("$desktopEnv 已在 chroot 中安装完成", "$desktopEnv installed in chroot"))
                 Log.i(TAG, "Desktop environment installation complete")
             } catch (e: Exception) {
                 Log.e(TAG, "DE install failed", e)
-                onProgress(-1.0, "Installation failed: ${e.message}")
+                onProgress(-1.0, t("安装失败：${e.message}", "Installation failed: ${e.message}"))
             }
         }
     }
@@ -636,14 +647,14 @@ SESSEOF
                         "cp -f ${shellQuote(stagedSource.absolutePath)} ${shellQuote(sourceInRootfs.absolutePath)}"
             )
 
-            onLog("Installing rooted-desktop compatibility support...\n")
+            onLog(t("正在安装 rooted 桌面兼容组件…\n", "Installing rooted-desktop compatibility support...\n"))
             var gccInstalled = execChroot(
                 "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev",
                 onLog,
             ) == 0
             if (!gccInstalled) {
                 // One retry for transient mirror/network hiccups.
-                onLog("gcc install failed, retrying once...\n")
+                onLog(t("gcc 安装失败，正在重试一次…\n", "gcc install failed, retrying once...\n"))
                 execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
                 gccInstalled = execChroot(
                     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev",
@@ -721,12 +732,15 @@ SESSEOF
         execChroot("mkdir -p /tmp/.X11-unix /tmp/runtime-root /root")
 
         // Refresh DNS — the phone's network may have changed since the
-        // rootfs was first extracted, and package installs can clobber resolv.conf
-        // Ubuntu makes resolv.conf a symlink to systemd; delete it first so writeText succeeds.
-        val resolvConf = File(rootfsDir, "etc/resolv.conf")
-        resolvConf.delete()
-        resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\n")
-        Log.i(TAG, "Refreshed chroot resolv.conf")
+        // rootfs was first extracted. Use the resolvers Android is actually
+        // using (plus domestic fallbacks and mirror IP pins) instead of a
+        // hardcoded 8.8.8.8, which is unreachable on many networks.
+        try {
+            DnsConfig.applyTo(rootfsDir, rootShell)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to refresh chroot DNS: ${e.message}")
+            DnsConfig.writeResolvConf(rootfsDir, DnsConfig.FALLBACK_DNS)
+        }
     }
 
     private fun mountIfNeeded(relative: String, mountArgs: String, alreadyMounted: () -> Boolean) {

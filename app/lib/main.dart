@@ -1,14 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/state/app_state.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/screens/welcome_screen.dart';
 import 'package:droiddesk/screens/home_screen.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppStrings.init();
   DroidDeskPlatform.init();
 
   runApp(

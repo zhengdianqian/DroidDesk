@@ -1,3 +1,4 @@
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/widgets/droid_ui.dart';
@@ -41,7 +42,9 @@ class _StorageScreenState extends State<StorageScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          freed < 0 ? 'Could not clean the package cache' : 'Freed ${_format(freed)}',
+          freed < 0
+              ? AppStrings.t('storage.cleanFailed')
+              : AppStrings.t('storage.freed', args: {'size': _format(freed)}),
         ),
         backgroundColor: freed < 0 ? DroidTheme.error : DroidTheme.success,
       ),
@@ -58,8 +61,8 @@ class _StorageScreenState extends State<StorageScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               DroidPageHeader(
-                title: 'Storage',
-                subtitle: 'Space used by Linux on this phone',
+                title: AppStrings.t('storage.title'),
+                subtitle: AppStrings.t('storage.subtitle'),
               ),
               Expanded(
                 child: _info == null
@@ -92,14 +95,18 @@ class _StorageScreenState extends State<StorageScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('LINUX USES', style: DroidTheme.label),
+                Text(AppStrings.t('storage.linuxUses'), style: DroidTheme.label),
                 const SizedBox(height: 6),
                 Text(
                   _format(linux),
                   style: DroidTheme.headingXl.copyWith(fontSize: 32),
                 ),
                 Text(
-                  '$packages packages · ${_format(free)} free of ${_format(total)}',
+                  AppStrings.t('storage.packagesLine', args: {
+                    'count': '$packages',
+                    'free': _format(free),
+                    'total': _format(total),
+                  }),
                   style: DroidTheme.bodySm,
                 ),
                 const SizedBox(height: 18),
@@ -110,17 +117,17 @@ class _StorageScreenState extends State<StorageScreen> {
                   (other, DroidTheme.textDim.withValues(alpha: 0.45)),
                 ]),
                 const SizedBox(height: 16),
-                _legend('Linux system', system, _systemColor),
-                _legend('Your files (home)', home, _homeColor),
-                _legend('Package cache', cache, _cacheColor),
-                _legend('Other apps & Android', other, DroidTheme.textDim),
-                _legend('Free', free, DroidTheme.surfaceBorder),
+                _legend(AppStrings.t('storage.legend.system'), system, _systemColor),
+                _legend(AppStrings.t('storage.legend.home'), home, _homeColor),
+                _legend(AppStrings.t('storage.legend.cache'), cache, _cacheColor),
+                _legend(AppStrings.t('storage.legend.other'), other, DroidTheme.textDim),
+                _legend(AppStrings.t('storage.legend.free'), free, DroidTheme.surfaceBorder),
               ],
             ),
           ),
         ),
         const SizedBox(height: 26),
-        DroidSectionLabel('Clean up'),
+        DroidSectionLabel(AppStrings.t('storage.cleanUp')),
         const SizedBox(height: 10),
         DroidGroupCard(
           child: Padding(
@@ -146,14 +153,15 @@ class _StorageScreenState extends State<StorageScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Package cache',
+                        AppStrings.t('storage.packageCache'),
                         style: DroidTheme.headingSm.copyWith(fontSize: 15),
                       ),
                       const SizedBox(height: 2),
                       Text(
                         cache > 0
-                            ? '${_format(cache)} of downloaded package files'
-                            : 'Nothing to clean',
+                            ? AppStrings.t('storage.cacheHint',
+                                args: {'size': _format(cache)})
+                            : AppStrings.t('storage.nothingToClean'),
                         style: DroidTheme.bodySm,
                       ),
                     ],
@@ -178,7 +186,7 @@ class _StorageScreenState extends State<StorageScreen> {
                               vertical: 7,
                             ),
                             child: Text(
-                              'CLEAN',
+                              AppStrings.t('storage.cleanButton'),
                               style: DroidTheme.label.copyWith(
                                 fontSize: 13,
                                 fontWeight: FontWeight.w700,
@@ -199,7 +207,7 @@ class _StorageScreenState extends State<StorageScreen> {
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4),
           child: Text(
-            'Cleaning removes downloaded installers only. Installed apps and your files stay.',
+            AppStrings.t('storage.cleanNote'),
             style: DroidTheme.bodySm,
           ),
         ),

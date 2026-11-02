@@ -29,6 +29,11 @@ object MirrorSelector {
         "http://mirrors.aliyun.com/ubuntu-ports",
     )
 
+    /** Hostnames behind [CANDIDATES]; pinned into the chroot /etc/hosts. */
+    val MIRROR_HOSTS: List<String> = CANDIDATES
+        .mapNotNull { runCatching { java.net.URI(it).host }.getOrNull() }
+        .distinct()
+
     /**
      * Read VERSION_CODENAME from the rootfs /etc/os-release so the
      * generated sources match the actual Ubuntu release (jammy, noble...).

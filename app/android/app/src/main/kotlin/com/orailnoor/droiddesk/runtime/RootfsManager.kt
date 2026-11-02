@@ -120,12 +120,12 @@ class RootfsManager(private val context: Context) {
                     completeMarker.exists() &&
                     completeMarker.readText().trim() == targetFile.length().toString()
                 ) {
-                    onProgress(1.0, "$distroName already downloaded")
+                    onProgress(1.0, L10n.tr(context, "$distroName 已下载完成", "$distroName already downloaded"))
                     configFile.writeText(distro)
                     return@thread
                 }
 
-                onProgress(0.0, "Connecting to download server...")
+                onProgress(0.0, L10n.tr(context, "正在连接下载服务器…", "Connecting to download server..."))
                 Log.i(TAG, "Downloading $distroName from $url")
 
                 val connection = URL(url).openConnection() as HttpURLConnection
@@ -159,7 +159,7 @@ class RootfsManager(private val context: Context) {
                         newConnection.setRequestProperty("Range", "bytes=$downloadedBytes-")
                     }
                     if (!downloadFromConnection(newConnection, targetFile, distroName, downloadedBytes, onProgress)) {
-                        onProgress(-1.0, "Download incomplete. Retry will resume from where it stopped.")
+                        onProgress(-1.0, L10n.tr(context, "下载未完成，点击重试将从断点继续", "Download incomplete. Retry will resume from where it stopped."))
                         return@thread
                     }
                 } else {
@@ -169,7 +169,7 @@ class RootfsManager(private val context: Context) {
                         downloadedBytes = 0L
                     }
                     if (!downloadFromConnection(connection, targetFile, distroName, downloadedBytes, onProgress)) {
-                        onProgress(-1.0, "Download incomplete. Retry will resume from where it stopped.")
+                        onProgress(-1.0, L10n.tr(context, "下载未完成，点击重试将从断点继续", "Download incomplete. Retry will resume from where it stopped."))
                         return@thread
                     }
                 }
@@ -178,7 +178,7 @@ class RootfsManager(private val context: Context) {
                 configFile.writeText(distro)
                 completeMarker.writeText(targetFile.length().toString())
 
-                onProgress(1.0, "$distroName downloaded successfully")
+                onProgress(1.0, L10n.tr(context, "$distroName 下载完成", "$distroName downloaded successfully"))
                 Log.i(TAG, "Download complete: ${targetFile.absolutePath}")
 
             } catch (e: Exception) {
@@ -200,7 +200,7 @@ class RootfsManager(private val context: Context) {
         val expectedTotal = downloadedBytes + totalBytes
 
         if (totalBytes == 0L) {
-            onProgress(1.0, "$distroName downloaded successfully")
+            onProgress(1.0, L10n.tr(context, "$distroName 下载完成", "$distroName downloaded successfully"))
             return true
         }
 
@@ -218,7 +218,11 @@ class RootfsManager(private val context: Context) {
                         val totalMB = expectedTotal / (1024 * 1024)
                         onProgress(
                             progress,
-                            "Downloading $distroName: ${downloadedMB}MB / ${totalMB}MB"
+                            L10n.tr(
+                                context,
+                                "正在下载 $distroName：${downloadedMB}MB / ${totalMB}MB",
+                                "Downloading $distroName: ${downloadedMB}MB / ${totalMB}MB",
+                            )
                         )
                     }
                 }
@@ -260,12 +264,12 @@ class RootfsManager(private val context: Context) {
                         File(context.filesDir, "SETUP_COMPLETE").exists()
                 if (alreadyExtracted) {
                     Log.i(TAG, "Skipping extraction: existing rootfs is valid")
-                    onProgress(1.0, "Rootfs already extracted")
+                    onProgress(1.0, L10n.tr(context, "rootfs 已解压完成", "Rootfs already extracted"))
                     return@thread
                 }
 
                 if (!tarball.exists()) {
-                    onProgress(-1.0, "Rootfs tarball not found. Download first.")
+                    onProgress(-1.0, L10n.tr(context, "未找到 rootfs 压缩包，请先下载", "Rootfs tarball not found. Download first."))
                     return@thread
                 }
 
@@ -275,7 +279,7 @@ class RootfsManager(private val context: Context) {
                 }
                 rootfsDir.mkdirs()
 
-                onProgress(0.1, "Extracting ${DISTRO_NAMES[distro]}...")
+                onProgress(0.1, L10n.tr(context, "正在解压 ${DISTRO_NAMES[distro]}…", "Extracting ${DISTRO_NAMES[distro]}..."))
                 Log.i(TAG, "Extracting rootfs from ${tarball.absolutePath}")
 
                 // Use ProcessBuilder to run tar extraction
@@ -311,7 +315,7 @@ class RootfsManager(private val context: Context) {
                     throw RuntimeException("tar failed (code $exitCode): $lastLine")
                 }
 
-                onProgress(0.7, "Configuring Linux environment...")
+                onProgress(0.7, L10n.tr(context, "正在配置 Linux 环境…", "Configuring Linux environment..."))
 
                 // Post-extraction configuration
                 configureRootfs()
@@ -322,7 +326,7 @@ class RootfsManager(private val context: Context) {
                 // Clean up tarball to save space
                 tarball.delete()
 
-                onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
+                onProgress(1.0, L10n.tr(context, "${DISTRO_NAMES[distro] ?: distro} 配置完成", "${DISTRO_NAMES[distro] ?: distro} setup complete"))
                 Log.i(TAG, "Rootfs extraction complete. Size: ${getRootfsSizeMB()} MB")
 
             } catch (e: Exception) {
@@ -340,15 +344,9 @@ class RootfsManager(private val context: Context) {
     private fun configureRootfs() {
         Log.i(TAG, "Configuring rootfs...")
 
-        // DNS resolution
-        File(rootfsDir, "etc/resolv.conf").apply {
-            parentFile?.mkdirs()
-            writeText("""
-                nameserver 8.8.8.8
-                nameserver 8.8.4.4
-                nameserver 1.1.1.1
-            """.trimIndent())
-        }
+        // DNS resolution — domestic resolvers first; ChrootRuntime.refresh()
+        // later replaces this with the resolvers Android is actually using.
+        DnsConfig.writeResolvConf(rootfsDir, DnsConfig.FALLBACK_DNS)
 
         // Disable apt sandbox (CRITICAL for Android)
         // If apt drops to the _apt user, it loses the Android 'inet' group and hangs indefinitely without network access.

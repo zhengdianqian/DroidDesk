@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/state/app_state.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
@@ -17,11 +18,11 @@ class AppCatalogScreen extends StatefulWidget {
 }
 
 class _AppCatalogScreenState extends State<AppCatalogScreen> {
-  static const _featured = [
+  static List<_FeaturedApp> get _featured => [
     _FeaturedApp(
       'firefox',
       'Firefox',
-      'Fast, private desktop web browser.',
+      AppStrings.t('app.firefox.desc'),
       Icons.public_rounded,
       Color(0xFFFF7139),
       iconNames: ['firefox'],
@@ -29,7 +30,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'code-oss',
       'Code OSS',
-      'Powerful desktop code editor and IDE.',
+      AppStrings.t('app.codeoss.desc'),
       Icons.code_rounded,
       Color(0xFF23A8F2),
       iconNames: ['vscode', 'code-oss'],
@@ -37,7 +38,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'libreoffice',
       'LibreOffice',
-      'Documents, spreadsheets, and presentations.',
+      AppStrings.t('app.libreoffice.desc'),
       Icons.description_rounded,
       Color(0xFF18A303),
       iconNames: ['libreoffice-startcenter', 'libreoffice-main'],
@@ -45,7 +46,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'gimp',
       'GIMP',
-      'Professional image editing and design tools.',
+      AppStrings.t('app.gimp.desc'),
       Icons.brush_rounded,
       Color(0xFF9A7654),
       iconNames: ['gimp'],
@@ -53,7 +54,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'blender',
       'Blender',
-      'Complete open-source 3D creation suite.',
+      AppStrings.t('app.blender.desc'),
       Icons.view_in_ar_rounded,
       Color(0xFFF5792A),
       iconNames: ['blender'],
@@ -61,7 +62,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'vlc',
       'VLC',
-      'Play almost every audio and video format.',
+      AppStrings.t('app.vlc.desc'),
       Icons.play_circle_rounded,
       Color(0xFFFF8800),
       iconNames: ['vlc'],
@@ -69,7 +70,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'nodejs',
       'Node.js + npm',
-      'JavaScript runtime and package manager.',
+      AppStrings.t('app.nodejs.desc'),
       Icons.javascript_rounded,
       Color(0xFF68A063),
       iconNames: [],
@@ -77,7 +78,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'python',
       'Python',
-      'Popular programming language and tools.',
+      AppStrings.t('app.python.desc'),
       Icons.terminal_rounded,
       Color(0xFFFFD43B),
       iconNames: ['python'],
@@ -85,7 +86,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _FeaturedApp(
       'imagemagick',
       'ImageMagick',
-      'Image conversion and processing toolkit.',
+      AppStrings.t('app.imagemagick.desc'),
       Icons.image_rounded,
       DroidTheme.primaryLight,
       iconNames: ['display-im6.q16'],
@@ -204,16 +205,19 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('Remove ${package.displayName}?'),
-        content: const Text('Dependent packages may also be affected.'),
+        title: Text(
+          AppStrings.t('catalog.removeDialog.title',
+              args: {'name': package.displayName}),
+        ),
+        content: Text(AppStrings.t('catalog.removeDialog.body')),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            child: Text(AppStrings.t('common.cancel')),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Remove'),
+            child: Text(AppStrings.t('catalog.remove')),
           ),
         ],
       ),
@@ -285,13 +289,18 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               DroidPageHeader(
-                title: 'Linux App Store',
-                subtitle: 'Apps and tools for your desktop',
+                title: AppStrings.t('catalog.title'),
+                subtitle: AppStrings.t('catalog.subtitle'),
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
                 child: DroidSegmentedTabs(
-                  labels: const ['Featured', 'Browse', 'Updates', 'Installed'],
+                  labels: [
+                    AppStrings.t('catalog.tab.featured'),
+                    AppStrings.t('catalog.tab.browse'),
+                    AppStrings.t('catalog.tab.updates'),
+                    AppStrings.t('catalog.tab.installed'),
+                  ],
                   icons: const [
                     Icons.auto_awesome_rounded,
                     Icons.search_rounded,
@@ -332,10 +341,10 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     final apps = [
       ..._featured,
       if (!state.hasRoot)
-        const _FeaturedApp(
+        _FeaturedApp(
           'proot_debian',
           'Debian Compatibility',
-          'Run packages unavailable in native repositories.',
+          AppStrings.t('app.debian.desc'),
           Icons.inventory_2_rounded,
           Color(0xFFD70A53),
           optional: true,
@@ -361,7 +370,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
       children: [
         _heroCard(hero, itemFor(hero), installerFor(hero)),
         const SizedBox(height: 26),
-        DroidSectionLabel('Popular apps'),
+        DroidSectionLabel(AppStrings.t('catalog.popularApps')),
         const SizedBox(height: 10),
         DroidGroupCard(
           child: Column(
@@ -405,7 +414,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'FEATURED',
+            AppStrings.t('catalog.featured'),
             style: DroidTheme.label.copyWith(color: app.color, letterSpacing: 1),
           ),
           const SizedBox(height: 14),
@@ -444,7 +453,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
           padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
           child: DroidSearchField(
             controller: _searchController,
-            hint: 'Search packages, apps and tools',
+            hint: AppStrings.t('catalog.searchHint'),
             onChanged: (value) {
               setState(() {});
               _queueSearch(value);
@@ -459,8 +468,8 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
                   children: [
                     DroidEmptyCard(
                       icon: Icons.search_off_rounded,
-                      title: 'No matching packages',
-                      subtitle: 'Try another name or keyword.',
+                      title: AppStrings.t('catalog.emptySearch.title'),
+                      subtitle: AppStrings.t('catalog.emptySearch.subtitle'),
                     ),
                   ],
                 )
@@ -526,8 +535,12 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
                       children: [
                         Text(
                           _updates.isEmpty
-                              ? 'Up to date'
-                              : '${_updates.length} update${_updates.length == 1 ? '' : 's'}',
+                              ? AppStrings.t('catalog.upToDate')
+                              : _updates.length == 1
+                                  ? AppStrings.t('catalog.updatesOne',
+                                      args: {'count': '${_updates.length}'})
+                                  : AppStrings.t('catalog.updatesMany',
+                                      args: {'count': '${_updates.length}'}),
                           style: DroidTheme.headingSm,
                         ),
                         const SizedBox(height: 2),
@@ -544,8 +557,8 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
                             Expanded(
                               child: Text(
                                 _checkingUpdates
-                                    ? 'Checking for updates…'
-                                    : 'Ready to install',
+                                    ? AppStrings.t('catalog.checking')
+                                    : AppStrings.t('catalog.readyToInstall'),
                                 style: DroidTheme.bodySm,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
@@ -559,7 +572,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
                   if (_updates.isNotEmpty) ...[
                     const SizedBox(width: 10),
                     _capsule(
-                      label: 'Update all',
+                      label: AppStrings.t('catalog.updateAll'),
                       compact: true,
                       color: DroidTheme.primary,
                       filled: true,
@@ -572,7 +585,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
           ),
           if (_updates.isNotEmpty) ...[
             const SizedBox(height: 26),
-            DroidSectionLabel('Available updates'),
+            DroidSectionLabel(AppStrings.t('catalog.availableUpdates')),
             const SizedBox(height: 10),
             DroidGroupCard(
               child: Column(
@@ -631,7 +644,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
           active
               ? _actionButton(package)
               : _capsule(
-                  label: 'Update',
+                  label: AppStrings.t('catalog.update'),
                   color: DroidTheme.primary,
                   onTap: busy ? null : () => _updateOne(package),
                 ),
@@ -651,7 +664,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
         children: [
           Row(
             children: [
-              DroidSectionLabel('Installed packages'),
+              DroidSectionLabel(AppStrings.t('catalog.installedPackages')),
               const Spacer(),
               if (_installedPackages.isNotEmpty)
                 Text('${_installedPackages.length}', style: DroidTheme.bodySm),
@@ -661,8 +674,8 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
           if (_installedPackages.isEmpty)
             DroidEmptyCard(
               icon: Icons.inventory_2_outlined,
-              title: 'Nothing installed yet',
-              subtitle: 'Apps you install from Featured or Browse show up here.',
+              title: AppStrings.t('catalog.emptyInstalled.title'),
+              subtitle: AppStrings.t('catalog.emptyInstalled.subtitle'),
             )
           else
             DroidGroupCard(
@@ -706,7 +719,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     final color = featured?.color ?? _categoryColor(package.section);
     final meta = [
       if (package.version.isNotEmpty) package.version,
-      package.gui ? 'GUI app' : package.section,
+      package.gui ? AppStrings.t('catalog.guiApp') : package.section,
     ].where((e) => e.isNotEmpty).join(' · ');
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 12, 12, 12),
@@ -734,7 +747,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
                 const SizedBox(height: 2),
                 Text(
                   package.description.isEmpty
-                      ? 'Linux package'
+                      ? AppStrings.t('catalog.linuxPackage')
                       : package.description,
                   style: DroidTheme.bodySm,
                   maxLines: 1,
@@ -778,7 +791,9 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
             Row(
               children: [
                 Text(
-                  appState.packageCancelling ? 'Cancelling…' : 'Installing…',
+                  appState.packageCancelling
+                      ? AppStrings.t('catalog.cancelling')
+                      : AppStrings.t('catalog.installing'),
                   style: DroidTheme.bodySm.copyWith(fontWeight: FontWeight.w600),
                 ),
                 const Spacer(),
@@ -837,7 +852,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     }
     if (installed && allowRemove && package.removable) {
       return _capsule(
-        label: 'Remove',
+        label: AppStrings.t('catalog.remove'),
         color: DroidTheme.error,
         onTap: busy ? null : () => _remove(package),
       );
@@ -856,7 +871,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
             const Icon(Icons.check_circle_rounded, size: 18, color: Colors.white),
             const SizedBox(width: 6),
             Text(
-              'INSTALLED',
+              AppStrings.t('catalog.installedBig'),
               style: DroidTheme.label.copyWith(
                 fontSize: 13,
                 fontWeight: FontWeight.w700,
@@ -882,7 +897,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
             const Icon(Icons.check_rounded, size: 15, color: DroidTheme.accent),
             const SizedBox(width: 4),
             Text(
-              'Installed',
+              AppStrings.t('catalog.installed'),
               style: DroidTheme.label.copyWith(
                 color: DroidTheme.accent,
                 letterSpacing: 0.1,
@@ -893,7 +908,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
       );
     }
     return _capsule(
-      label: 'Get',
+      label: AppStrings.t('catalog.get'),
       color: DroidTheme.primary,
       filled: prominent,
       onTap: busy

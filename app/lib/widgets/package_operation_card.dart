@@ -1,3 +1,4 @@
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/state/app_state.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/widgets/linux_app_icon.dart';
@@ -134,12 +135,12 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
   Widget _running(AppState state) {
     final value = state.packageProgress > 0 ? state.packageProgress : null;
     final verb = state.packageCancelling
-        ? 'Cancelling'
+        ? AppStrings.t('package.verb.cancelling')
         : state.packageRemoving
-            ? 'Removing'
+            ? AppStrings.t('package.verb.removing')
             : state.isUpdatingAll
-                ? 'Updating'
-                : 'Installing';
+                ? AppStrings.t('package.verb.updating')
+                : AppStrings.t('package.verb.installing');
     final log = state.packageLog
         .replaceAll(RegExp(r'\x1B\[[0-?]*[ -/]*[@-~]'), '')
         .split('\n')
@@ -163,7 +164,10 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        '$verb ${state.activePackageName}',
+                        AppStrings.t('package.runningTitle', args: {
+                          'verb': verb,
+                          'name': state.activePackageName,
+                        }),
                         style: DroidTheme.headingSm.copyWith(fontSize: 15),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -190,7 +194,7 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
                 _roundButton(
                   icon: Icons.close_rounded,
                   color: DroidTheme.error,
-                  tooltip: 'Cancel',
+                  tooltip: AppStrings.t('package.cancel'),
                   busy: state.packageCancelling,
                   onTap: state.packageCancelling || state.packageRemoving
                       ? null
@@ -217,7 +221,9 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
                   child: Row(
                     children: [
                       Text(
-                        _showLog ? 'Hide details' : 'Show details',
+                        _showLog
+                            ? AppStrings.t('package.hideDetails')
+                            : AppStrings.t('package.showDetails'),
                         style: DroidTheme.bodySm.copyWith(
                           color: DroidTheme.primary,
                           fontWeight: FontWeight.w600,
@@ -288,8 +294,8 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
                   const SizedBox(height: 2),
                   Text(
                     !result.isUpdateAll && success && !result.removed
-                        ? 'Find it in the desktop app menu'
-                        : 'Open the App Store for details',
+                        ? AppStrings.t('package.findInMenu')
+                        : AppStrings.t('package.openStore'),
                     style: DroidTheme.bodySm,
                   ),
                 ],
@@ -304,7 +310,7 @@ class _PackageOperationCardState extends State<PackageOperationCard> {
             _roundButton(
               icon: Icons.close_rounded,
               color: DroidTheme.textMuted,
-              tooltip: 'Dismiss',
+              tooltip: AppStrings.t('package.dismiss'),
               onTap: state.dismissPackageResult,
             ),
           ],

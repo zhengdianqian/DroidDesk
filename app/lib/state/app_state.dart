@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/services/update_service.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
@@ -8,6 +9,9 @@ import 'package:droiddesk/theme/droid_theme.dart';
 class AppState extends ChangeNotifier {
   // ── Theme State ──
   ThemeMode _themeMode = ThemeMode.dark;
+
+  // ── Language State ──
+  String _language = AppStrings.lang;
 
   // ── Setup State ──
   bool _isBootstrapped = false;
@@ -38,7 +42,7 @@ class AppState extends ChangeNotifier {
 
   // Terminal history
   final List<String> _terminalOutput = [
-    'DroidDesk Linux Terminal\nType commands below.\n',
+    AppStrings.t('terminal.header'),
   ];
   List<String> get terminalOutput => _terminalOutput;
 
@@ -59,6 +63,7 @@ class AppState extends ChangeNotifier {
 
   // ── Getters ──
   ThemeMode get themeMode => _themeMode;
+  String get language => _language;
   bool get isDarkMode => DroidTheme.isDark;
   bool get isBootstrapped => _isBootstrapped;
   bool get isRunning => _isRunning;
@@ -91,10 +96,10 @@ class AppState extends ChangeNotifier {
 
   String get gpuType {
     final vendor = _deviceInfo['gpuVendor']?.toString() ?? '';
-    if (vendor.contains('adreno')) return 'Adreno (Snapdragon)';
-    if (vendor.contains('mali')) return 'Mali (MediaTek/Exynos)';
-    if (vendor.contains('powervr')) return 'PowerVR';
-    return 'Unknown GPU';
+    if (vendor.contains('adreno')) return AppStrings.t('state.gpu.adreno');
+    if (vendor.contains('mali')) return AppStrings.t('state.gpu.mali');
+    if (vendor.contains('powervr')) return AppStrings.t('state.gpu.powervr');
+    return AppStrings.t('state.gpu.unknown');
   }
 
   // ── Initialization ──
@@ -116,11 +121,12 @@ class AppState extends ChangeNotifier {
 
     // Set up progress callbacks
     DroidDeskPlatform.onDownloadProgress = (progress, status) {
+      final localizedStatus = AppStrings.localizeNativeStatus(status);
       _downloadProgress = progress;
-      _downloadStatus = status;
+      _downloadStatus = localizedStatus;
       if (progress < 0) {
         _isDownloading = false;
-        _errorMessage = status;
+        _errorMessage = localizedStatus;
       } else if (progress >= 1.0) {
         _isDownloading = false;
       }
@@ -128,11 +134,12 @@ class AppState extends ChangeNotifier {
     };
 
     DroidDeskPlatform.onExtractProgress = (progress, status) {
+      final localizedStatus = AppStrings.localizeNativeStatus(status);
       _extractProgress = progress;
-      _extractStatus = status;
+      _extractStatus = localizedStatus;
       if (progress < 0) {
         _isExtracting = false;
-        _errorMessage = status;
+        _errorMessage = localizedStatus;
       } else if (progress >= 1.0) {
         _isExtracting = false;
         refreshStatus();
@@ -141,14 +148,15 @@ class AppState extends ChangeNotifier {
     };
 
     DroidDeskPlatform.onInstallProgress = (progress, status) {
+      final localizedStatus = AppStrings.localizeNativeStatus(status);
       _extractProgress = progress; // reusing extract progress state for UI
-      _extractStatus = status;
-      _statusMessage = status;
+      _extractStatus = localizedStatus;
+      _statusMessage = localizedStatus;
       _isInstallingDE = progress >= 0 && progress < 1.0;
       if (progress < 0) {
         _isExtracting = false;
         _isInstallingDE = false;
-        _errorMessage = status;
+        _errorMessage = localizedStatus;
       } else if (progress >= 1.0) {
         _isExtracting = false;
         _isInstallingDE = false;
@@ -189,7 +197,7 @@ class AppState extends ChangeNotifier {
 
     DroidDeskPlatform.onOptionalInstallProgress = (progress, status) {
       _optionalInstallProgress = progress.clamp(0.0, 1.0);
-      _optionalInstallStatus = status;
+      _optionalInstallStatus = AppStrings.localizeNativeStatus(status);
       notifyListeners();
     };
 
@@ -253,6 +261,16 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Switches the UI language (`'zh'` or `'en'`) and persists it. Watchers of
+  /// [AppState] rebuild immediately, so no restart is needed.
+  Future<void> setLanguage(String lang) async {
+    final next = AppStrings.normalize(lang);
+    if (_language == next) return;
+    _language = next;
+    await AppStrings.setLang(next);
+    notifyListeners();
+  }
+
   Future<void> refreshStatus() async {
     try {
       final status = await DroidDeskPlatform.getRuntimeStatus();
@@ -268,7 +286,7 @@ class AppState extends ChangeNotifier {
 
       notifyListeners();
     } catch (e) {
-      _errorMessage = 'Failed to get runtime status: $e';
+      _errorMessage = AppStrings.t('state.error.runtimeStatus', args: {'error': '$e'});
       notifyListeners();
     }
   }
@@ -331,7 +349,7 @@ class AppState extends ChangeNotifier {
       _setupStep = 4;
       notifyListeners();
     } catch (e) {
-      _errorMessage = 'Setup failed: $e';
+      _errorMessage = AppStrings.t('state.error.setupFailed', args: {'error': '$e'});
       _isDownloading = false;
       _isExtracting = false;
       _isInstallingDE = false;
@@ -342,13 +360,13 @@ class AppState extends ChangeNotifier {
   Future<void> _runNativeSetup() async {
     _isExtracting = true;
     _extractProgress = 0.0;
-    _extractStatus = 'Extracting native Termux bootstrap...';
+    _extractStatus = AppStrings.t('state.status.extractingBootstrap');
     _statusMessage = _extractStatus;
     notifyListeners();
     await DroidDeskPlatform.setupBootstrap();
 
     _extractProgress = 0.08;
-    _extractStatus = 'Bootstrap environment ready';
+    _extractStatus = AppStrings.t('state.status.bootstrapReady');
     _statusMessage = _extractStatus;
     _isInstallingDE = true;
     notifyListeners();
@@ -356,7 +374,7 @@ class AppState extends ChangeNotifier {
       de: _selectedDE,
     );
     if (!installed) {
-      throw StateError('Native Termux package installation failed');
+      throw StateError(AppStrings.t('state.error.nativeInstallFailed'));
     }
     _isExtracting = false;
     _isInstallingDE = false;
@@ -365,31 +383,28 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _runChrootSetup() async {
-    _statusMessage = 'Downloading Ubuntu rootfs...';
+    _statusMessage = AppStrings.t('state.status.downloadingRootfs');
     _isDownloading = true;
     _downloadProgress = 0.0;
     notifyListeners();
     if (!await DroidDeskPlatform.downloadRootfs(_selectedDistro)) {
-      throw StateError(
-        'Ubuntu download failed. Check your connection and retry.',
-      );
+      throw StateError(AppStrings.t('state.error.downloadFailed'));
     }
 
     _isDownloading = false;
     _isExtracting = true;
     _extractProgress = 0.0;
-    _statusMessage = 'Extracting rootfs...';
+    _statusMessage = AppStrings.t('state.status.extractingRootfs');
     notifyListeners();
     if (!await DroidDeskPlatform.extractRootfs()) {
-      throw StateError('Ubuntu filesystem extraction failed');
+      throw StateError(AppStrings.t('state.error.extractFailed'));
     }
 
-    _statusMessage =
-        'Installing desktop environment (this may take a while)...';
+    _statusMessage = AppStrings.t('state.status.installingDesktop');
     _isInstallingDE = true;
     notifyListeners();
     if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
-      throw StateError('Desktop Essentials package installation failed');
+      throw StateError(AppStrings.t('state.error.desktopEssentialsFailed'));
     }
     _isExtracting = false;
     _isInstallingDE = false;
@@ -401,7 +416,7 @@ class AppState extends ChangeNotifier {
     // Handled inside runSetup for chroot mode.
     // Kept for API compatibility.
     _extractProgress = 1.0;
-    _extractStatus = 'Extraction handled by setup flow';
+    _extractStatus = AppStrings.t('state.status.extractionHandled');
     notifyListeners();
   }
 
@@ -409,20 +424,20 @@ class AppState extends ChangeNotifier {
     try {
       _isExtracting = true;
       _extractProgress = 0.0;
-      _statusMessage = 'Installing Desktop Environment...';
+      _statusMessage = AppStrings.t('state.status.installingDe');
       _errorMessage = null;
       notifyListeners();
 
       if (_hasRoot) {
         if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
-          throw StateError('Desktop Essentials package installation failed');
+          throw StateError(AppStrings.t('state.error.desktopEssentialsFailed'));
         }
       } else {
         final installed = await DroidDeskPlatform.installDesktopNative(
           de: _selectedDE,
         );
         if (!installed) {
-          throw StateError('Native Termux package installation failed');
+          throw StateError(AppStrings.t('state.error.nativeInstallFailed'));
         }
       }
 
@@ -430,7 +445,7 @@ class AppState extends ChangeNotifier {
       _isInstallingDE = false;
       await refreshStatus();
     } catch (e) {
-      _errorMessage = 'Installation failed: $e';
+      _errorMessage = AppStrings.t('state.error.installFailed', args: {'error': '$e'});
       _isExtracting = false;
       _isInstallingDE = false;
       notifyListeners();
@@ -452,7 +467,7 @@ class AppState extends ChangeNotifier {
     if (_installingOptionalApp != null) return false;
     _installingOptionalApp = appId;
     _optionalInstallProgress = 0.0;
-    _optionalInstallStatus = 'Preparing installation...';
+    _optionalInstallStatus = AppStrings.t('package.preparingInstall');
     _optionalInstallLog = '';
     notifyListeners();
 
@@ -535,7 +550,7 @@ class AppState extends ChangeNotifier {
       if (release == null && manual) DroidDeskPlatform.cleanupUpdates();
     } catch (error) {
       if (manual) {
-        _updateError = 'Could not reach GitHub. Check your connection.';
+        _updateError = AppStrings.t('state.error.githubUnreachable');
         _updateErrorCode = 'network';
       }
     } finally {
@@ -574,10 +589,12 @@ class AppState extends ChangeNotifier {
         _updateErrorCode = result['code']?.toString();
         _updateError = switch (_updateErrorCode) {
           'cancelled' => null,
-          'signature_mismatch' =>
-            'This release is signed with a different key. Install it once from the release page.',
-          'size_mismatch' || 'network' => 'The download did not finish. Check your connection and try again.',
-          _ => result['message']?.toString() ?? 'The update could not be downloaded.',
+          'signature_mismatch' => AppStrings.t('update.error.signatureMismatch'),
+          'size_mismatch' || 'network' =>
+            AppStrings.t('update.error.downloadIncomplete'),
+          _ =>
+            result['message']?.toString() ??
+                AppStrings.t('update.error.downloadFailed'),
         };
         notifyListeners();
         return false;
@@ -588,7 +605,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     final opened = await DroidDeskPlatform.installUpdate(path);
     if (!opened) {
-      _updateError = 'Could not open the installer.';
+      _updateError = AppStrings.t('update.error.installer');
       _updateErrorCode = 'installer';
       notifyListeners();
     }
@@ -632,7 +649,7 @@ class AppState extends ChangeNotifier {
   void _onPackageProgress(double progress, String status) {
     if (_activePackage == null) return;
     _packageProgress = progress.clamp(0.0, 1.0);
-    _packageStatus = status;
+    _packageStatus = AppStrings.localizeNativeStatus(status);
     notifyListeners();
   }
 
@@ -657,7 +674,9 @@ class AppState extends ChangeNotifier {
     _packageRemoving = removing;
     _packageCancelling = false;
     _packageProgress = 0;
-    _packageStatus = removing ? 'Preparing removal...' : 'Preparing $displayName...';
+    _packageStatus = removing
+        ? AppStrings.t('package.preparingRemoval')
+        : AppStrings.t('package.preparing', args: {'name': displayName});
     _packageLog = '';
     notifyListeners();
   }
@@ -717,8 +736,13 @@ class AppState extends ChangeNotifier {
   /// Upgrades all non-core packages through the same progress UI as installs.
   Future<bool> updateAllPackages() async {
     if (_activePackage != null) return false;
-    _startPackageOperation(updatesOperation, 'packages', const [], removing: false);
-    _packageStatus = 'Checking for updates...';
+    _startPackageOperation(
+      updatesOperation,
+      AppStrings.t('package.allPackages'),
+      const [],
+      removing: false,
+    );
+    _packageStatus = AppStrings.t('package.checkingUpdates');
     var ok = false;
     try {
       ok = await DroidDeskPlatform.upgradeAllPackages();
@@ -730,7 +754,7 @@ class AppState extends ChangeNotifier {
   Future<void> cancelPackageOperation() async {
     if (_activePackage == null || _packageCancelling || _packageRemoving) return;
     _packageCancelling = true;
-    _packageStatus = 'Cancelling installation...';
+    _packageStatus = AppStrings.t('package.cancellingInstall');
     notifyListeners();
     await DroidDeskPlatform.cancelNativePackageOperation();
   }
@@ -758,12 +782,12 @@ class AppState extends ChangeNotifier {
         height: height,
       );
       if (!started) {
-        throw StateError('Linux runtime is not ready');
+        throw StateError(AppStrings.t('state.error.runtimeNotReady'));
       }
       _isRunning = true;
       notifyListeners();
     } catch (e) {
-      _errorMessage = 'Failed to start: $e';
+      _errorMessage = AppStrings.t('state.error.startFailed', args: {'error': '$e'});
       notifyListeners();
     }
   }
@@ -772,7 +796,7 @@ class AppState extends ChangeNotifier {
     try {
       await DroidDeskPlatform.launchDesktopActivity();
     } catch (e) {
-      _errorMessage = 'Failed to launch desktop activity: $e';
+      _errorMessage = AppStrings.t('state.error.launchDesktop', args: {'error': '$e'});
       notifyListeners();
     }
   }
@@ -783,7 +807,7 @@ class AppState extends ChangeNotifier {
       _isRunning = false;
       notifyListeners();
     } catch (e) {
-      _errorMessage = 'Failed to stop: $e';
+      _errorMessage = AppStrings.t('state.error.stopFailed', args: {'error': '$e'});
       notifyListeners();
     }
   }
@@ -796,7 +820,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       return await DroidDeskPlatform.executeCommand(command);
     } catch (e) {
-      return "Error executing command: $e";
+      return AppStrings.t('state.error.command', args: {'error': '$e'});
     } finally {
       if (!isInput) {
         _runningCommands--;
@@ -824,7 +848,7 @@ class AppState extends ChangeNotifier {
 
   void clearTerminal() {
     _terminalOutput.clear();
-    _terminalOutput.add('DroidDesk Linux Terminal\nType commands below.\n');
+    _terminalOutput.add(AppStrings.t('terminal.header'));
     notifyListeners();
   }
 
@@ -864,13 +888,17 @@ class PackageOperationResult {
 
   String get message => isUpdateAll
       ? (cancelled
-          ? 'Update cancelled'
+          ? AppStrings.t('package.result.updateCancelled')
           : ok
-              ? 'Packages updated'
-              : 'Some updates failed')
+              ? AppStrings.t('package.result.packagesUpdated')
+              : AppStrings.t('package.result.someUpdatesFailed'))
       : cancelled
-      ? '$displayName installation cancelled'
+      ? AppStrings.t('package.result.installCancelled', args: {'name': displayName})
       : removed
-          ? (ok ? '$displayName removed' : 'Could not remove $displayName')
-          : (ok ? '$displayName installed' : '$displayName installation failed');
+          ? (ok
+              ? AppStrings.t('package.result.removed', args: {'name': displayName})
+              : AppStrings.t('package.result.removeFailed', args: {'name': displayName}))
+          : (ok
+              ? AppStrings.t('package.result.installed', args: {'name': displayName})
+              : AppStrings.t('package.result.installFailed', args: {'name': displayName}));
 }

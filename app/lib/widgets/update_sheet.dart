@@ -1,3 +1,4 @@
+import 'package:droiddesk/l10n/app_strings.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/services/update_service.dart';
 import 'package:droiddesk/state/app_state.dart';
@@ -84,19 +85,16 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
       final proceed = await showDialog<bool>(
         context: context,
         builder: (dialogContext) => AlertDialog(
-          title: const Text('Update now?'),
-          content: const Text(
-            'Installing restarts DroidDesk. The running Linux desktop will stop; '
-            'your files and apps stay.',
-          ),
+          title: Text(AppStrings.t('update.nowDialog.title')),
+          content: Text(AppStrings.t('update.nowDialog.body')),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
+              child: Text(AppStrings.t('common.cancel')),
             ),
             FilledButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Update'),
+              child: Text(AppStrings.t('update.update')),
             ),
           ],
         ),
@@ -135,7 +133,7 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 18),
-          Text('Update available', style: DroidTheme.headingMd),
+          Text(AppStrings.t('update.available'), style: DroidTheme.headingMd),
           const SizedBox(height: 2),
           Text(
             'v${state.appVersion}  →  v${release.version}'
@@ -178,7 +176,7 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text("WHAT'S NEW", style: DroidTheme.label),
+                  Text(AppStrings.t('update.whatsNew'), style: DroidTheme.label),
                   const SizedBox(height: 8),
                   Text(
                     release.notes.isEmpty ? release.title : _plain(release.notes),
@@ -195,7 +193,7 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
         ],
         const SizedBox(height: 12),
         _notice(
-          'Installing restarts DroidDesk. Your Linux files and apps stay.',
+          AppStrings.t('update.restartNote'),
           DroidTheme.textMuted,
           Icons.info_outline_rounded,
         ),
@@ -207,17 +205,17 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
               mode: LaunchMode.externalApplication,
             ),
             icon: const Icon(Icons.open_in_new_rounded, size: 19),
-            label: const Text('Open release page'),
+            label: Text(AppStrings.t('update.openReleasePage')),
           )
         else
           ElevatedButton(
             onPressed: _onUpdatePressed,
             child: Text(
               state.downloadedUpdatePath != null
-                  ? 'Install'
+                  ? AppStrings.t('update.install')
                   : state.updateError != null
-                      ? 'Try again'
-                      : 'Update',
+                      ? AppStrings.t('update.tryAgain')
+                      : AppStrings.t('update.update'),
             ),
           ),
         const SizedBox(height: 6),
@@ -229,13 +227,16 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
                   await state.skipUpdate();
                   if (mounted) Navigator.of(context).pop();
                 },
-                child: Text('Skip this version', style: TextStyle(color: DroidTheme.textMuted)),
+                child: Text(
+                  AppStrings.t('update.skipThisVersion'),
+                  style: TextStyle(color: DroidTheme.textMuted),
+                ),
               ),
             ),
             Expanded(
               child: TextButton(
                 onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Later'),
+                child: Text(AppStrings.t('update.later')),
               ),
             ),
           ],
@@ -273,11 +274,13 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Allow app updates', style: DroidTheme.headingSm),
+                    Text(
+                      AppStrings.t('update.permission.title'),
+                      style: DroidTheme.headingSm,
+                    ),
                     const SizedBox(height: 4),
                     Text(
-                      'Android needs your permission for DroidDesk to install its own updates. '
-                      'On the next screen turn on "Allow from this source", then come back.',
+                      AppStrings.t('update.permission.body'),
                       style: DroidTheme.bodySm,
                     ),
                   ],
@@ -292,12 +295,12 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
             _waitingForPermission = true;
             await DroidDeskPlatform.openInstallPermission();
           },
-          child: const Text('Continue'),
+          child: Text(AppStrings.t('update.permission.continue')),
         ),
         const SizedBox(height: 6),
         TextButton(
           onPressed: () => setState(() => _step = _Step.info),
-          child: const Text('Not now'),
+          child: Text(AppStrings.t('update.permission.notNow')),
         ),
       ],
     );
@@ -325,7 +328,9 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
                 children: [
                   Expanded(
                     child: Text(
-                      downloading ? 'Downloading update…' : 'Opening installer…',
+                      downloading
+                          ? AppStrings.t('update.downloading')
+                          : AppStrings.t('update.openingInstaller'),
                       style: DroidTheme.headingSm,
                     ),
                   ),
@@ -350,7 +355,10 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
               const SizedBox(height: 8),
               Text(
                 total > 0
-                    ? '${_mb(state.updateDownloaded)} of ${_mb(total)}'
+                    ? AppStrings.t('update.progress', args: {
+                        'downloaded': _mb(state.updateDownloaded),
+                        'total': _mb(total),
+                      })
                     : _mb(state.updateDownloaded),
                 style: DroidTheme.bodySm,
               ),
@@ -362,10 +370,13 @@ class _UpdateSheetState extends State<UpdateSheet> with WidgetsBindingObserver {
           TextButton(
             onPressed: state.cancelUpdateDownload,
             style: TextButton.styleFrom(foregroundColor: DroidTheme.error),
-            child: const Text('Cancel download'),
+            child: Text(AppStrings.t('update.cancelDownload')),
           )
         else
-          ElevatedButton(onPressed: _start, child: const Text('Install')),
+          ElevatedButton(
+            onPressed: _start,
+            child: Text(AppStrings.t('update.install')),
+          ),
       ],
     );
   }
