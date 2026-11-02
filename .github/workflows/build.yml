@@ -12,10 +12,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: apk-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -49,14 +45,9 @@ jobs:
         run: flutter pub get
 
       - name: Build release APK
-        run: flutter build apk --release
-
-      - name: Report signing certificate
-        working-directory: .
         run: |
-          APK=app/build/app/outputs/flutter-apk/app-release.apk
-          APK_TOOL=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
-          "$APK_TOOL" verify --print-certs "$APK" | grep -E "SHA-256|SHA-1|Subject" || true
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee /tmp/build.log
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -72,47 +63,56 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk ${{ github.ref_name }}
+          name: DroidDesk 1.4.0
           fail_on_unmatched_files: true
           files: app/build/app/outputs/flutter-apk/app-release.apk
           body: |
             ## DroidDesk 1.4.0
 
-            本版基于 1.3.3 源码（tag `v1.3.3`）继续迭代，`versionCode` 9。
+            基于 1.3.3 源码（tag `v1.3.3`）继续迭代，versionCode 9，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
             ### 稳定性
-            - 前台服务常驻 + 30 秒会话看护，桌面进程被系统回收后自动拉起（最多 3 次）
-            - 桌面会话崩溃日志落盘（`desktop.log`，512 KiB 轮转），App 内可直接查看与清空
-            - 安卓 12+ 子进程限制（phantom process killer）检测；root 可一键放宽，无 root 给出开发者选项指引
+            - 前台服务常驻 + 30 秒会话看护，桌面进程被回收后自动拉起（最多 3 次）
+            - 桌面崩溃日志落盘（512 KiB 轮转），App 内可查看与清空
+            - 安卓 12+ 子进程限制检测；root 可一键放宽，无 root 给出指引
 
             ### 软件源与安装
-            - 修复 root/chroot 桌面下商店包管理器目标错位导致的安装失败
+            - 修复 root/chroot 下商店包管理器目标错位导致的安装失败
             - 安装失败完整错误回显并写入日志
-            - 一键切换到国内 Ubuntu 镜像（清华/中科大/阿里云自动探测）
-            - 一键修复软件包管理器：`dpkg --configure -a`、`apt-get -f install`、刷新索引
+            - 一键换国内镜像（清华/中科大/阿里云自动探测）
+            - 一键修复：`dpkg --configure -a`、`apt-get -f install`、刷新索引
 
             ### 桌面外观
-            - XFCE 移动化配置：顶部状态栏（应用菜单/任务列表/托盘/时钟）+ 底部 Dock（商店/终端/文件/浏览器）
-            - 触屏友好的图标与面板尺寸，可切换“省电/标准”两档（省电关闭合成器与动画）
+            - 顶栏（应用菜单/任务列表/托盘/时钟）+ 底部 Dock（商店/终端/文件/浏览器）
+            - 触屏尺寸，可切“省电/标准”，省电档关闭合成器与动画
 
             ### 中文环境
-            - 默认 `zh_CN.UTF-8` locale，`LANG`/`LC_ALL`/`LANGUAGE` 已设置
-            - 预装 Noto CJK 中文字体，Xft DPI 随界面缩放同步
-            - 默认中文输入法 IBus + libpinyin，首次进桌面即为中文
+            - 默认 `zh_CN.UTF-8`，设置 LANG/LC_ALL/LANGUAGE
+            - 预装 Noto CJK 字体，Xft DPI 随缩放同步
+            - 默认 IBus + libpinyin 中文输入法
 
             ### 触控板输入法
-            - 仅当 X11 可编辑控件真正获得焦点（IBus FocusIn）时弹出软键盘，失焦自动收起
-            - 设置内可关闭“自动弹出输入法”
+            - 仅 X11 可编辑控件获得焦点（IBus FocusIn）时弹软键盘，失焦收起，可关闭
 
-            ### 桌面应用商店与 deb
-            - 桌面新增商店入口：搜索/安装 apt 包、安装本地 .deb、一键修复软件源
-            - deb 文件可通过系统选择器安装（root/chroot），自动补齐依赖并保留终端错误信息
+            ### 桌面商店与 deb
+            - 桌面商店：搜索安装 apt 包、安装本地 .deb、一键修复软件源
+            - deb 通过系统选择器安装（root/chroot），自动补依赖并保留错误信息
             - 自动生成桌面图标与开始菜单项
 
             ### 显示
-            - 默认“跟随设备”：X11 帧缓冲 = 屏幕物理像素 1:1，渲染层关闭线性过滤
-            - 可选 1080p / 2K 分辨率档位，界面缩放 1.0x / 1.25x / 1.5x / 2.0x 在桌面内部完成，不再拉伸画面
-            - 设置页显示当前实际生效分辨率
+            - 默认跟随设备：帧缓冲 = 物理像素 1:1，关闭线性过滤
+            - 可选 1080p / 2K；界面缩放 1.0/1.25/1.5/2.0 在桌面内部完成，不拉伸画面
+            - 设置页显示当前生效分辨率
 
-            ### 构建
-            - 与 1.3.3 相同签名（`droiddesk-release.jks`），可直接覆盖安装
+
+      - name: Dump build log on failure
+        if: failure()
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tail -n 80 /tmp/build.log > /tmp/tail.log || true
+          BODY=$(printf '### CI build failed\n\n```\n%s\n```\n' "$(cat /tmp/tail.log)")
+          gh api --method POST "repos/${{ github.repository }}/comments" \
+            -f "commit_id=${{ github.sha }}" \
+            -f "body=$BODY" || true
