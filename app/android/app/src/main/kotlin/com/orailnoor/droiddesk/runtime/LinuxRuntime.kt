@@ -2393,8 +2393,9 @@ if [ -z "${'$'}ADDR" ]; then
     echo "watcher-error:no-a11y-bus" > "${'$'}ROLE" 2>/dev/null || true
     exit 0
 fi
+printf '-\n' > "${'$'}ROLE" 2>/dev/null || true
 echo "DIAG: a11y bus ${'$'}ADDR"
-dbus-monitor --address="${'$'}ADDR" \
+dbus-monitor --address "${'$'}ADDR" \
     "type=signal,interface=org.a11y.atspi.Event.Object,member=StateChanged" 2>/dev/null |
 awk '
 /^signal/ {
@@ -2415,7 +2416,7 @@ while IFS='|' read -r sender path detail; do
         write_state 0
         continue
     fi
-    role="${'$'}(dbus-send --address="${'$'}ADDR" --print-reply --dest="${'$'}sender "${'$'}path" \
+    role="${'$'}(dbus-send --bus="${'$'}ADDR" --print-reply --dest="${'$'}sender "${'$'}path" \
         org.a11y.atspi.Accessible.GetRole 2>/dev/null | awk '/uint32/ {print ${'$'}2; exit}')"
     printf '%s\n' "${'$'}{role:-?}" > "${'$'}ROLE" 2>/dev/null || true
     case "${'$'}role" in
