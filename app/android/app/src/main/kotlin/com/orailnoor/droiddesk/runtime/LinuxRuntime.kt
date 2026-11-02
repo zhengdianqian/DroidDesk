@@ -1370,7 +1370,12 @@ class LinuxRuntime(private val context: Context) {
                 prefixDir,
                 "share/vulkan/icd.d/freedreno_icd.aarch64.json",
             )
-            if (!isDpkgPackageInstalled("mesa-vulkan-icd-freedreno") || !freedrenoIcd.exists()) {
+            // The ICD file is proof enough that the package is installed. dpkg-query
+            // through this shell can block for ~40 s (the largest single chunk of the
+            // 62 s session start), so never run it when the file is already there.
+            val adrenoReady = freedrenoIcd.isFile ||
+                isDpkgPackageInstalled("mesa-vulkan-icd-freedreno")
+            if (!adrenoReady) {
                 onProgress?.invoke(progress, "Installing Adreno Turnip acceleration...")
                 if (!installPackageGroup("pkg install -y mesa-vulkan-icd-freedreno")) {
                     Log.e(TAG, "Adreno Turnip/Freedreno installation failed")
@@ -2619,7 +2624,17 @@ DROIDDESK_X11
                         n=${'$'}((n + 1))
                     done
                     echo "DIAG: wallpaper channels patched=${'$'}n"
-                    xfdesktop --reload >/dev/null 2>&1 || pkill -USR1 -x xfdesktop >/dev/null 2>&1 || true
+                    # This xfdesktop build has no --reload, and SIGUSR1 terminates it
+                    # (default action), which is exactly why the desktop stayed black.
+                    # Reload when supported, otherwise restart it so it re-reads xfconf.
+                    if xfdesktop --reload >/dev/null 2>&1; then
+                        echo "DIAG: xfdesktop reloaded"
+                    else
+                        pkill -TERM -x xfdesktop >/dev/null 2>&1 || true
+                        sleep 0.2
+                        ( xfdesktop >/dev/null 2>&1 & )
+                        echo "DIAG: xfdesktop restarted"
+                    fi
                 fi
             ) &
             exec $desktopCommand
