@@ -112,6 +112,18 @@ class RootfsManager(private val context: Context) {
 
                 downloadDir.mkdirs()
                 val targetFile = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
+                val completeMarker = File(targetFile.absolutePath + ".complete")
+
+                // A previous run already finished this download — reuse the
+                // file instead of touching the network so retries are cheap.
+                if (targetFile.exists() && targetFile.length() > 0 &&
+                    completeMarker.exists() &&
+                    completeMarker.readText().trim() == targetFile.length().toString()
+                ) {
+                    onProgress(1.0, "$distroName already downloaded")
+                    configFile.writeText(distro)
+                    return@thread
+                }
 
                 onProgress(0.0, "Connecting to download server...")
                 Log.i(TAG, "Downloading $distroName from $url")
@@ -131,6 +143,7 @@ class RootfsManager(private val context: Context) {
                 // Handle redirects or Already Satisfied (416)
                 if (connection.responseCode == 416) {
                     // Already fully downloaded
+                    completeMarker.writeText(targetFile.length().toString())
                     onProgress(1.0, "$distroName already downloaded")
                     configFile.writeText(distro)
                     return@thread
@@ -145,18 +158,25 @@ class RootfsManager(private val context: Context) {
                     if (downloadedBytes > 0) {
                         newConnection.setRequestProperty("Range", "bytes=$downloadedBytes-")
                     }
-                    downloadFromConnection(newConnection, targetFile, distroName, downloadedBytes, onProgress)
+                    if (!downloadFromConnection(newConnection, targetFile, distroName, downloadedBytes, onProgress)) {
+                        onProgress(-1.0, "Download incomplete. Retry will resume from where it stopped.")
+                        return@thread
+                    }
                 } else {
                     // If server ignored Range header (returned 200 instead of 206), we must restart
                     if (connection.responseCode == 200 && downloadedBytes > 0) {
                         targetFile.delete()
                         downloadedBytes = 0L
                     }
-                    downloadFromConnection(connection, targetFile, distroName, downloadedBytes, onProgress)
+                    if (!downloadFromConnection(connection, targetFile, distroName, downloadedBytes, onProgress)) {
+                        onProgress(-1.0, "Download incomplete. Retry will resume from where it stopped.")
+                        return@thread
+                    }
                 }
 
                 // Save distro selection
                 configFile.writeText(distro)
+                completeMarker.writeText(targetFile.length().toString())
 
                 onProgress(1.0, "$distroName downloaded successfully")
                 Log.i(TAG, "Download complete: ${targetFile.absolutePath}")
@@ -174,14 +194,14 @@ class RootfsManager(private val context: Context) {
         distroName: String,
         initialDownloadedBytes: Long,
         onProgress: (Double, String) -> Unit
-    ) {
+    ): Boolean {
         var downloadedBytes = initialDownloadedBytes
         val totalBytes = connection.contentLengthLong
         val expectedTotal = downloadedBytes + totalBytes
 
         if (totalBytes == 0L) {
             onProgress(1.0, "$distroName downloaded successfully")
-            return
+            return true
         }
 
         val buffer = ByteArray(BUFFER_SIZE)
@@ -205,6 +225,16 @@ class RootfsManager(private val context: Context) {
             }
         }
         connection.disconnect()
+
+        // A premature EOF used to be treated as success, which let a truncated
+        // tarball through and broke the whole install. Verify the byte count
+        // against Content-Length before declaring victory; on failure the
+        // partial file is kept so the next retry resumes with a Range request.
+        if (expectedTotal > 0 && downloadedBytes < expectedTotal) {
+            Log.w(TAG, "Incomplete download: $downloadedBytes of $expectedTotal bytes")
+            return false
+        }
+        return true
     }
 
     // ── Extraction ──
@@ -220,6 +250,19 @@ class RootfsManager(private val context: Context) {
             try {
                 val distro = getInstalledDistro()
                 val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
+
+                // Reuse a fully extracted + configured rootfs. This is what
+                // keeps a failed desktop install from wiping all prior work
+                // on retry (extract is expensive and the tarball is normally
+                // deleted after a successful extraction).
+                val alreadyExtracted = File(rootfsDir, "bin/bash").exists() &&
+                        File(rootfsDir, "usr/bin/dpkg").exists() &&
+                        File(context.filesDir, "SETUP_COMPLETE").exists()
+                if (alreadyExtracted) {
+                    Log.i(TAG, "Skipping extraction: existing rootfs is valid")
+                    onProgress(1.0, "Rootfs already extracted")
+                    return@thread
+                }
 
                 if (!tarball.exists()) {
                     onProgress(-1.0, "Rootfs tarball not found. Download first.")
@@ -373,6 +416,21 @@ class RootfsManager(private val context: Context) {
             "dev/shm"
         ).forEach {
             File(rootfsDir, it).mkdirs()
+        }
+
+        // Multi-mirror APT sources: HEAD-probe the mirror list (3s timeout)
+        // and write the first reachable ARM64 ubuntu-ports mirror so the
+        // install never depends on ports.ubuntu.com being reachable.
+        try {
+            val codename = MirrorSelector.detectCodename(rootfsDir)
+            val mirror = MirrorSelector.probeReachable(codename).firstOrNull()
+            if (mirror != null) {
+                MirrorSelector.writeSources(rootfsDir, mirror, codename)
+            } else {
+                Log.w(TAG, "No APT mirror reachable during configure; install step will re-probe")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Mirror selection failed during configure: ${e.message}")
         }
 
         Log.i(TAG, "Rootfs configuration complete")

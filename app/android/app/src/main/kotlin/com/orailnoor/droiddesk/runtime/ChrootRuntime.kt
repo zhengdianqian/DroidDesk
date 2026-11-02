@@ -190,9 +190,26 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.05, "Repairing interrupted packages...")
                 execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
 
-                onProgress(0.05, "Updating package index...")
-                if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) != 0) {
-                    throw IllegalStateException("Package index update failed")
+                onProgress(0.05, "Selecting fastest APT mirror...")
+                val codename = MirrorSelector.detectCodename(rootfsDir)
+                val mirrors = MirrorSelector.probeReachable(codename)
+                var aptUpdated = false
+                if (mirrors.isEmpty()) {
+                    // No mirror answered the HEAD probe (offline?); try existing sources.
+                    aptUpdated = execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0
+                } else {
+                    for (mirror in mirrors) {
+                        onLog("Using APT mirror $mirror ($codename, arm64)\n")
+                        MirrorSelector.writeSources(rootfsDir, mirror, codename)
+                        if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0) {
+                            aptUpdated = true
+                            break
+                        }
+                        onLog("apt-get update failed through $mirror, trying next mirror...\n")
+                    }
+                }
+                if (!aptUpdated) {
+                    throw IllegalStateException("Package index update failed (all mirrors unreachable)")
                 }
 
                 onProgress(0.1, "Installing Android kernel compatibility...")
@@ -620,11 +637,20 @@ SESSEOF
             )
 
             onLog("Installing rooted-desktop compatibility support...\n")
-            if (execChroot(
+            var gccInstalled = execChroot(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev",
+                onLog,
+            ) == 0
+            if (!gccInstalled) {
+                // One retry for transient mirror/network hiccups.
+                onLog("gcc install failed, retrying once...\n")
+                execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
+                gccInstalled = execChroot(
                     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev",
                     onLog,
-                ) != 0
-            ) return false
+                ) == 0
+            }
+            if (!gccInstalled) return false
 
             val buildCommand = """
                 set -e

@@ -33,3 +33,8 @@ local.properties
 /app/sources.list.*
 /app/test_*.sh
 /app/android/app/close_range_hack.c
+
+# Fork release key is intentionally committed so future releases of this
+# fork can be signed with the same key (user-approved; see fork notes).
+!app/android/key.properties
+!app/android/droiddesk-release.jks

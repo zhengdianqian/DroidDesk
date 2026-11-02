@@ -12,3 +12,8 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# Exception: this fork's release key is intentionally committed so future
+# releases can be signed consistently (user-approved).
+!key.properties
+!droiddesk-release.jks
