@@ -71,15 +71,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk 1.4.3
+          name: DroidDesk 1.4.4
           fail_on_unmatched_files: true
           files: DroidDesk-${{ github.ref_name }}-arm64.apk
           body: |
-            ## DroidDesk 1.4.3
+            ## DroidDesk 1.4.4
 
-            基于 1.4.2 继续迭代，versionCode 12，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+            基于 1.4.3 继续迭代，versionCode 13，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
-            ### 1.4.3 更新
+            ### 1.4.4 更新
+            - 输入法上屏：`sendTextEvent` 在 VTE 中不生效，改为内置 `droiddesk-x11-type`（XTest）；ASCII 走 keysym + 必要时 Shift，中文等非 Latin-1 字符映射为 Unicode keysym（`0x01000000 | codepoint`）后由 XTest 按下，候选词提交可真正进入终端
+            - 输入法桥的删除、回车也改走同一注入通道（组合预览改动只删差异字符）
+            - 商店网络：启动时探测设备代理 `127.0.0.1:2080`，可用则写入 apt `Acquire::http/https::Proxy` 与 `~/.bashrc`/运行时 `http_proxy/https_proxy`，由代理解析域名，绕开 guest 无法解析 DNS 的问题
+
+            ### 1.4.3 更新（沿用）
             - 壁纸：桌面启动后按 `xfconf-query -l` 枚举实际存在的 `xfce4-desktop` last-image 通道，逐个写入壁纸并 `xfdesktop --reload`；0.75x 等缩放档位不再变纯黑
             - 启动耗时：`startSession` 每步（bootstrap/环境整理/图形检查/profile/launcher 同步/会话总线/无障碍总线/会话拉起）与各阶段（含等待桌面）都输出 `TIMING` 打点，定位 62 秒分布
             - 输入法：续 1.4.2 的 AT-SPI 焦点桥，保持只有可编辑控件聚焦时才请求系统输入法

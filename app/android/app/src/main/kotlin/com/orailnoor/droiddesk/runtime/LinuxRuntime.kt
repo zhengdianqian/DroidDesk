@@ -1234,6 +1234,290 @@ class LinuxRuntime(private val context: Context) {
         }
     }
 
+    /**
+     * Builds the XTest helper the Android IME bridge uses to type into X11 apps.
+     *
+     * Termux:X11's sendTextEvent() never reaches VTE, so committed IME text is replayed
+     * as real key events. ASCII keysyms keep their physical keycode (pressing Shift when
+     * the symbol sits on the upper level); every other character (Chinese, non Latin-1
+     * punctuation) is mapped onto a spare keycode as a Unicode keysym
+     * (0x01000000 | codepoint) and then pressed with XTest.
+     */
+    private fun ensureTextInjector(): File? {
+        val bin = File(binDir, "droiddesk-x11-type")
+        val src = File(tmpDir, "x11_type.c")
+        val marker = File(binDir, ".x11_type_build")
+        val source = """
+            #include <X11/Xlib.h>
+            #include <X11/Xutil.h>
+            #include <X11/keysym.h>
+            #include <X11/extensions/XTest.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <unistd.h>
+
+            static Display *dpy = NULL;
+            static int spare_kc = 0;
+            static int shift_kc = 0;
+
+            static void tap(int kc, int shift) {
+                if (shift && shift_kc) XTestFakeKeyEvent(dpy, shift_kc, True, CurrentTime);
+                XTestFakeKeyEvent(dpy, kc, True, CurrentTime);
+                XTestFakeKeyEvent(dpy, kc, False, CurrentTime);
+                if (shift && shift_kc) XTestFakeKeyEvent(dpy, shift_kc, False, CurrentTime);
+                XFlush(dpy);
+                usleep(8000);
+            }
+
+            static int find_spare_keycode(void) {
+                int min_kc = 0, max_kc = 0, per = 0;
+                XDisplayKeycodes(dpy, &min_kc, &max_kc);
+                KeySym *map = XGetKeyboardMapping(dpy, min_kc, max_kc - min_kc + 1, &per);
+                if (!map) return 0;
+                int found = 0;
+                for (int kc = max_kc; kc >= min_kc && found == 0; kc--) {
+                    int free_slot = 1;
+                    for (int j = 0; j < per; j++) {
+                        if (map[(kc - min_kc) * per + j] != NoSymbol) { free_slot = 0; break; }
+                    }
+                    if (free_slot) found = kc;
+                }
+                XFree(map);
+                return found;
+            }
+
+            static void send_keysym(KeySym ks) {
+                KeyCode kc = XKeysymToKeycode(dpy, ks);
+                int usable = 0, shift = 0;
+                if (kc) {
+                    int per = 0;
+                    KeySym *map = XGetKeyboardMapping(dpy, kc, 1, &per);
+                    if (map) {
+                        if (per > 0 && map[0] == ks) { usable = 1; shift = 0; }
+                        else if (per > 1 && map[1] == ks) { usable = 1; shift = 1; }
+                        XFree(map);
+                    }
+                }
+                if (usable) { tap(kc, shift); return; }
+                KeySym syms[2];
+                syms[0] = ks;
+                syms[1] = ks;
+                XChangeKeyboardMapping(dpy, spare_kc, 2, syms, 1);
+                XSync(dpy, False);
+                usleep(20000);
+                tap(spare_kc, 0);
+            }
+
+            static void send_codepoint(unsigned cp) {
+                if (cp == '\n' || cp == '\r') { send_keysym(XK_Return); return; }
+                if (cp == '\t') { send_keysym(XK_Tab); return; }
+                if (cp == 8 || cp == 127) { send_keysym(XK_BackSpace); return; }
+                if (cp >= 0x20 && cp <= 0x7e) { send_keysym((KeySym)cp); return; }
+                send_keysym((KeySym)(0x01000000u | cp));
+            }
+
+            int main(int argc, char **argv) {
+                if (argc < 2) {
+                    fprintf(stderr, "usage: --type TEXT | --backspace N | --return N\n");
+                    return 2;
+                }
+                dpy = XOpenDisplay(NULL);
+                if (!dpy) { fprintf(stderr, "cannot open display\n"); return 3; }
+                int ev = 0, er = 0, major = 0, minor = 0;
+                if (!XTestQueryExtension(dpy, &ev, &er, &major, &minor)) {
+                    fprintf(stderr, "XTEST unavailable\n");
+                    XCloseDisplay(dpy);
+                    return 4;
+                }
+                shift_kc = XKeysymToKeycode(dpy, XK_Shift_L);
+                spare_kc = find_spare_keycode();
+                if (!spare_kc) spare_kc = 255;
+
+                const char *mode = argv[1];
+                if (strcmp(mode, "--type") == 0 && argc > 2) {
+                    const unsigned char *p = (const unsigned char *)argv[2];
+                    while (*p) {
+                        unsigned cp = 0;
+                        if (*p < 0x80) {
+                            cp = *p++;
+                        } else if ((*p & 0xE0) == 0xC0 && p[1]) {
+                            cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+                            p += 2;
+                        } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+                            cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+                            p += 3;
+                        } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
+                            cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) |
+                                 ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+                            p += 4;
+                        } else {
+                            p++;
+                            continue;
+                        }
+                        send_codepoint(cp);
+                    }
+                } else if (strcmp(mode, "--backspace") == 0) {
+                    int n = (argc > 2) ? atoi(argv[2]) : 1;
+                    for (int i = 0; i < n; i++) send_keysym(XK_BackSpace);
+                } else if (strcmp(mode, "--return") == 0) {
+                    int n = (argc > 2) ? atoi(argv[2]) : 1;
+                    for (int i = 0; i < n; i++) send_keysym(XK_Return);
+                } else {
+                    fprintf(stderr, "unknown mode\n");
+                    XCloseDisplay(dpy);
+                    return 2;
+                }
+                XSync(dpy, False);
+                XCloseDisplay(dpy);
+                return 0;
+            }
+        """.trimIndent() + "\n"
+
+        if (bin.isFile && marker.isFile &&
+            marker.readTextOrNull().orEmpty() == source.hashCode().toString()
+        ) {
+            return bin
+        }
+        src.writeText(source)
+        val compiler = File(binDir, "clang")
+        if (!compiler.exists()) {
+            DesktopLog.append(context, TAG, "text injector skipped: clang missing")
+            return null
+        }
+        return runCatching {
+            val process = ProcessBuilder(
+                compiler.absolutePath,
+                src.absolutePath,
+                "-O2",
+                "-o", bin.absolutePath,
+                "-I", File(prefixDir, "include").absolutePath,
+                "-L", File(prefixDir, "lib").absolutePath,
+                "-lX11",
+                "-lXtst",
+            )
+                .redirectErrorStream(true)
+                .also { pb ->
+                    pb.environment().clear()
+                    pb.environment()["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
+                    pb.environment()["TMPDIR"] = tmpDir.absolutePath
+                }
+                .start()
+            val log = process.inputStream.bufferedReader().readText()
+            val code = process.waitFor()
+            if (code == 0) {
+                marker.writeText(source.hashCode().toString())
+                DesktopLog.append(context, TAG, "text injector compiled")
+                bin
+            } else {
+                DesktopLog.append(context, TAG, "text injector build failed ($code): $log")
+                null
+            }
+        }.getOrElse {
+            DesktopLog.append(context, TAG, "text injector build error: ${it.message}")
+            null
+        }
+    }
+
+    /** Replays committed IME text as real X key events. False when injection is unavailable. */
+    fun injectX11Text(text: String): Boolean {
+        if (text.isEmpty()) return true
+        return runTextInjector("--type", text)
+    }
+
+    fun injectX11Backspace(count: Int): Boolean {
+        if (count <= 0) return true
+        return runTextInjector("--backspace", count.toString())
+    }
+
+    fun injectX11Return(count: Int): Boolean {
+        if (count <= 0) return true
+        return runTextInjector("--return", count.toString())
+    }
+
+    private fun runTextInjector(mode: String, payload: String): Boolean {
+        val bin = File(binDir, "droiddesk-x11-type")
+        if (!bin.isFile) return false
+        return runCatching {
+            val builder = ProcessBuilder(bin.absolutePath, mode, payload)
+                .redirectErrorStream(true)
+            builder.environment().apply {
+                clear()
+                putAll(getTermuxEnv())
+            }
+            val process = builder.start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val code = process.waitFor()
+            if (output.isNotBlank()) {
+                DesktopLog.append(context, TAG, "X11TYPE $mode: ${output.trim()}")
+            }
+            code == 0
+        }.getOrElse {
+            DesktopLog.append(context, TAG, "X11TYPE $mode failed: ${it.message}")
+            false
+        }
+    }
+
+    /**
+     * The guest has no working resolver (UDP/53 is blocked for the app uid), so package
+     * managers are pointed at the device-wide HTTP proxy when one is actually listening.
+     * Probing first keeps a dead proxy from shadowing a direct connection.
+     */
+    @Volatile private var storeProxyUsable = false
+    @Volatile private var storeProxyCheckedAt = 0L
+
+    private fun storeProxyAvailable(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - storeProxyCheckedAt in 0 until 60_000L) return storeProxyUsable
+        storeProxyCheckedAt = now
+        storeProxyUsable = runCatching {
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", 2080), 400)
+            }
+            true
+        }.getOrDefault(false)
+        if (!storeProxyUsable) {
+            DesktopLog.append(context, TAG, "store proxy 127.0.0.1:2080 unreachable; using direct")
+        }
+        return storeProxyUsable
+    }
+
+    private fun ensureStoreProxyConfig() {
+        val aptConf = File(prefixDir, "etc/apt/apt.conf.d/99droiddesk-proxy")
+        val bashrc = File(homeDir, ".bashrc")
+        val marker = "# droiddesk-store-proxy"
+        if (!storeProxyAvailable()) {
+            runCatching {
+                if (aptConf.exists() && aptConf.delete()) {
+                    DesktopLog.append(context, TAG, "store proxy config removed (proxy down)")
+                }
+            }
+            return
+        }
+        runCatching {
+            aptConf.parentFile?.mkdirs()
+            aptConf.writeText(
+                "# DroidDesk: guest has no DNS, let the host proxy resolve and fetch.\n" +
+                    "Acquire::http::Proxy \"http://127.0.0.1:2080\";\n" +
+                    "Acquire::https::Proxy \"http://127.0.0.1:2080\";\n"
+            )
+            val current = bashrc.readTextOrNull().orEmpty()
+            if (!current.contains(marker)) {
+                val block = marker + "\n" +
+                    "export http_proxy=http://127.0.0.1:2080\n" +
+                    "export https_proxy=http://127.0.0.1:2080\n" +
+                    "export HTTP_PROXY=http://127.0.0.1:2080\n" +
+                    "export HTTPS_PROXY=http://127.0.0.1:2080\n" +
+                    "export no_proxy=127.0.0.1,localhost,::1\n"
+                bashrc.parentFile?.mkdirs()
+                bashrc.writeText(current + (if (current.isEmpty() || current.endsWith("\n")) "" else "\n") + block)
+            }
+            DesktopLog.append(context, TAG, "store proxy config written")
+        }.onFailure {
+            DesktopLog.append(context, TAG, "store proxy config failed: ${it.message}")
+        }
+    }
+
     // ── Environment Configuration ──
 
     private fun getTermuxEnv(): Map<String, String> {
@@ -1280,6 +1564,20 @@ class LinuxRuntime(private val context: Context) {
 
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = tmpDir.absolutePath
+
+        // Package managers run inside the guest, which has no working resolver. When the
+        // device-wide HTTP proxy is up it also resolves host names, so export it here for
+        // apt-get/pkg/curl/wget launched from this runtime.
+        if (storeProxyAvailable()) {
+            val proxy = "http://127.0.0.1:2080"
+            env["http_proxy"] = proxy
+            env["https_proxy"] = proxy
+            env["HTTP_PROXY"] = proxy
+            env["HTTPS_PROXY"] = proxy
+            env["all_proxy"] = proxy
+            env["no_proxy"] = "127.0.0.1,localhost,::1"
+            env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+        }
 
         env["PERL5LIB"] = "${prefixDir.absolutePath}/lib/perl5/core_perl:${prefixDir.absolutePath}/lib/perl5/site_perl:${prefixDir.absolutePath}/lib/perl5/vendor_perl:${prefixDir.absolutePath}/lib/perl5"
         env["PYTHONHOME"] = prefixDir.absolutePath
@@ -2267,6 +2565,12 @@ class LinuxRuntime(private val context: Context) {
         // the compile cost only once.
         val focusProbe = ensureFocusProbe()
         mark("focus-probe")
+        // IME text never reached VTE through sendTextEvent(); compile the XTest injector
+        // once so committed characters can be replayed as real key events.
+        ensureTextInjector()
+        mark("type-probe")
+        ensureStoreProxyConfig()
+        mark("store-proxy")
         onPhase("启动会话总线")
 
         // Remove stale Xfce ICE listeners left by a killed/restarted activity.

@@ -368,7 +368,12 @@ class DesktopActivity : Activity() {
         // typing, so the system keyboard (including Chinese IMEs) targets it and committed
         // text is injected into the X session instead of being replayed key by key.
         if (imeAnchor == null) {
-            imeAnchor = GuestImeAnchor(this) { lorieView }.also { anchor ->
+            imeAnchor = GuestImeAnchor(
+                ctx = this,
+                typeText = ::imeTypeText,
+                deleteText = ::imeDelete,
+                pressKey = ::imePressKey,
+            ).also { anchor ->
                 placeholder.addView(anchor, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
                 anchor.isFocusableInTouchMode = true
                 // Must stay VISIBLE (alpha 0, one pixel): INVISIBLE views cannot hold focus.
@@ -1260,11 +1265,63 @@ class DesktopActivity : Activity() {
         }
     }
 
+    /**
+     * One queue for every IME side effect keeps commits, backspaces and composing text
+     * in the exact order they were produced. Injection runs off the main thread because
+     * each request spawns the XTest helper.
+     */
+    private val imeInjector = Executors.newSingleThreadExecutor()
+
+    private fun imeTypeText(text: String) {
+        if (text.isEmpty()) return
+        imeInjector.execute {
+            val ok = runCatching { linuxRuntime.injectX11Text(text) }.getOrDefault(false)
+            if (!ok) {
+                runOnUiThread { lorieView?.sendTextEvent(text.toByteArray(Charsets.UTF_8)) }
+            }
+        }
+    }
+
+    private fun imeDelete(count: Int) {
+        if (count <= 0) return
+        imeInjector.execute {
+            val ok = runCatching { linuxRuntime.injectX11Backspace(count) }.getOrDefault(false)
+            if (!ok) {
+                runOnUiThread {
+                    repeat(count) {
+                        lorieView?.sendKeyEvent(0, KeyEvent.KEYCODE_DEL, true)
+                        lorieView?.sendKeyEvent(0, KeyEvent.KEYCODE_DEL, false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun imePressKey(keyCode: Int) {
+        imeInjector.execute {
+            val ok = when (keyCode) {
+                KeyEvent.KEYCODE_DEL -> runCatching { linuxRuntime.injectX11Backspace(1) }.getOrDefault(false)
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER ->
+                    runCatching { linuxRuntime.injectX11Return(1) }.getOrDefault(false)
+                else -> false
+            }
+            if (!ok) {
+                runOnUiThread {
+                    lorieView?.let { view ->
+                        view.sendKeyEvent(0, keyCode, true)
+                        view.sendKeyEvent(0, keyCode, false)
+                    }
+                }
+            }
+        }
+    }
+
     override fun onDestroy() {
         collapsedFadeHandler.removeCallbacks(fadeCollapsedControl)
         imePolling = false
         imePollThread?.interrupt()
         imePollThread = null
+        imeInjector.shutdownNow()
         clipboardSync?.stop()
         clipboardSync = null
         extraKeysBar?.releaseAll()
@@ -1299,7 +1356,9 @@ class DesktopActivity : Activity() {
  */
 private class GuestImeAnchor(
     private val ctx: android.content.Context,
-    private val target: () -> LorieView?,
+    private val typeText: (String) -> Unit,
+    private val deleteText: (Int) -> Unit,
+    private val pressKey: (Int) -> Unit,
 ) : EditText(ctx) {
     init {
         alpha = 0f
@@ -1324,10 +1383,10 @@ private class GuestImeAnchor(
 
             private fun commitToX(text: CharSequence?): Boolean {
                 val value = text?.toString().orEmpty()
-                if (value == "\n" || value == "\r\n") {
-                    forwardKey(KeyEvent.KEYCODE_ENTER)
-                } else if (value.isNotEmpty()) {
-                    target()?.sendTextEvent(value.toByteArray(Charsets.UTF_8))
+                if (value.isNotEmpty()) {
+                    // XTest injection: Termux:X11's sendTextEvent() never reached VTE, so
+                    // committed text is replayed as real key events.
+                    typeText(value)
                 }
                 // Keep the anchor itself empty; it is not a visible editor.
                 super.commitText("", 1)
@@ -1349,7 +1408,7 @@ private class GuestImeAnchor(
                 if (mirrored.isNotEmpty()) {
                     // The IME changed the word between composing and commit; replace
                     // the mirrored preview before sending the final text.
-                    repeat(mirrored.length.coerceAtMost(32)) { forwardKey(KeyEvent.KEYCODE_DEL) }
+                    deleteText(mirrored.length.coerceAtMost(32))
                 }
                 return commitToX(value)
             }
@@ -1374,10 +1433,11 @@ private class GuestImeAnchor(
                 ) {
                     common++
                 }
-                repeat(previous.length - common) { forwardKey(KeyEvent.KEYCODE_DEL) }
+                val removed = previous.length - common
+                if (removed > 0) deleteText(removed)
                 val suffix = next.substring(common)
                 if (suffix.isNotEmpty()) {
-                    target()?.sendTextEvent(suffix.toByteArray(Charsets.UTF_8))
+                    typeText(suffix)
                 }
                 composing = next
                 return true
@@ -1389,22 +1449,16 @@ private class GuestImeAnchor(
             }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                repeat(beforeLength.coerceAtMost(16)) { forwardKey(KeyEvent.KEYCODE_DEL) }
+                deleteText(beforeLength.coerceAtMost(16))
                 return true
             }
 
             override fun sendKeyEvent(event: KeyEvent?): Boolean {
                 if (event != null && event.action == KeyEvent.ACTION_DOWN) {
-                    forwardKey(event.keyCode)
+                    pressKey(event.keyCode)
                 }
                 return true
             }
         }
-    }
-
-    private fun forwardKey(keyCode: Int) {
-        val view = target() ?: return
-        view.sendKeyEvent(0, keyCode, true)
-        view.sendKeyEvent(0, keyCode, false)
     }
 }
