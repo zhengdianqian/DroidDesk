@@ -888,6 +888,7 @@ class DesktopActivity : Activity() {
 
     private fun <T> runPhase(phase: String, timeoutMs: Long, block: () -> T): T {
         setPhase(phase)
+        val phaseStartedAt = android.os.SystemClock.elapsedRealtime()
         val executor = Executors.newSingleThreadExecutor()
         val future = executor.submit<T> { block() }
         try {
@@ -899,6 +900,12 @@ class DesktopActivity : Activity() {
             throw (failure.cause ?: failure)
         } finally {
             executor.shutdownNow()
+            DesktopLog.append(
+                this,
+                TAG,
+                "TIMING phase=$phase start=+${phaseStartedAt - loadingStartedAt}ms " +
+                    "duration=${android.os.SystemClock.elapsedRealtime() - phaseStartedAt}ms",
+            )
         }
     }
 

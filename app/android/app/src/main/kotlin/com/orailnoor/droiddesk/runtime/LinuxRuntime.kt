@@ -2068,9 +2068,15 @@ class LinuxRuntime(private val context: Context) {
         onPhase: (String) -> Unit = {},
     ) {
         val selectedDesktop = normalizedDesktop(desktopEnv)
+        val timingStart = android.os.SystemClock.elapsedRealtime()
+        fun mark(label: String) {
+            val ms = android.os.SystemClock.elapsedRealtime() - timingStart
+            DesktopLog.append(context, TAG, "TIMING $label +${ms}ms")
+        }
         onPhase("检查 Linux 运行环境")
         DesktopLog.append(context, TAG, "native session start requested (${width}x$height)")
         extractBootstrapIfNeeded(context)
+        mark("bootstrap")
 
         if (isRunning()) {
             Log.w(TAG, "Session already running")
@@ -2084,6 +2090,7 @@ class LinuxRuntime(private val context: Context) {
         onPhase("清理上次会话残留")
         cleanupStaleSession()
         prepareSessionEnvironment(onPhase)
+        mark("cleanup+env")
 
         // Packages whose maintainer scripts failed on older releases stay half-configured and
         // block every later apt install (and with it the Adreno driver). Finish them once
@@ -2100,6 +2107,7 @@ class LinuxRuntime(private val context: Context) {
         if (!ensureGraphicsPackages()) {
             throw IllegalStateException("图形运行时不可用（Mesa 缺失且安装失败），请检查网络后重试")
         }
+        mark("graphics")
 
         val clipboardTool = File(binDir, "xclip")
         if (!clipboardTool.isFile) {
@@ -2122,6 +2130,7 @@ class LinuxRuntime(private val context: Context) {
                     Log.w(TAG, "Window fitting helper unavailable; windows will keep their default size")
                 }
             }
+            mark("profile:begin")
             XfceMobileProfile.install(
                 context = context,
                 homeDir = homeDir.apply { mkdirs() },
@@ -2130,11 +2139,13 @@ class LinuxRuntime(private val context: Context) {
                     ".local/share/backgrounds/droiddesk-ubuntu-touch.jpg",
                 ),
             )
+            mark("profile:end")
             // Enumerating every installed Android app through python costs ~40 s and
             // changes rarely, so refresh at most once every six hours.
             val syncMarker = File(baseDir, ".android_apps_synced")
             val syncFresh = syncMarker.isFile &&
                 (System.currentTimeMillis() - syncMarker.lastModified()) < 6 * 60 * 60 * 1000L
+            mark("launcher-sync:begin")
             if (!syncFresh) {
                 AndroidAppBridge.syncLaunchers(
                     context = context,
@@ -2145,11 +2156,13 @@ class LinuxRuntime(private val context: Context) {
             } else {
                 DesktopLog.append(context, TAG, "android launcher sync skipped (cache fresh)")
             }
+            mark("launcher-sync:end")
         }
 
         // X11ServerService owns this socket. Never delete it from the client runtime.
         File(tmpDir, ".X11-unix").mkdirs()
 
+        mark("dbus:begin")
         onPhase("启动会话总线")
 
         // Remove stale Xfce ICE listeners left by a killed/restarted activity.
@@ -2225,6 +2238,8 @@ class LinuxRuntime(private val context: Context) {
             dbusProcess = null
             throw IllegalStateException("会话总线（dbus）启动失败：${e.message}", e)
         }
+
+        mark("dbus:end")
 
         // GTK3 loads its accessibility bridge as a GtkModule named "atk-bridge". The
         // Termux bootstrap ships libatk-bridge-2.0.so but not the module directory GTK
@@ -2311,6 +2326,12 @@ class LinuxRuntime(private val context: Context) {
         // releases. The session binary starts the same XFCE components and
         // preserves DroidDesk's prepared environment.
         val desktopCommand = "xfce4-session"
+        // Same path the Xfce profile writes into xfce4-desktop.xml; the wallpaper
+        // enforcement block below re-applies it to the channels xfdesktop created.
+        val wallpaperInSession = File(
+            homeDir,
+            ".local/share/backgrounds/droiddesk-ubuntu-touch.jpg",
+        ).absolutePath
 
         val runScript = """
             # ── AT-SPI accessibility bus (used by the Android IME bridge) ──
@@ -2443,6 +2464,36 @@ DROIDDESK_SH
                 sleep 0.25
             done
             echo "DIAG: display ready=${'$'}display_ready"
+
+            # xfdesktop names its backdrop channels after the framebuffer size, so the
+            # profile's monitorbuiltin/monitor0..3 entries can all miss the channel that
+            # actually exists and the desktop falls back to pure black after a switch.
+            # Enumerate the channels xfconfd really created and write the wallpaper into
+            # every one of them, then ask xfdesktop to reload.
+            WALLPAPER="${wallpaperInSession}"
+            (
+                i=0
+                while [ "${'$'}i" -lt 60 ]; do
+                    if command -v xfconf-query >/dev/null 2>&1 && \
+                        xfconf-query -c xfce4-desktop -l 2>/dev/null | grep -q last-image; then
+                        break
+                    fi
+                    i=${'$'}((i + 1))
+                    sleep 0.5
+                done
+                if command -v xfconf-query >/dev/null 2>&1; then
+                    n=0
+                    for prop in ${'$'}(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image); do
+                        xfconf-query -c xfce4-desktop -p "${'$'}prop" -s "${'$'}WALLPAPER" >/dev/null 2>&1 || true
+                        base=${'$'}{prop%/last-image}
+                        xfconf-query -c xfce4-desktop -p "${'$'}base/image-style" -s 5 >/dev/null 2>&1 || true
+                        xfconf-query -c xfce4-desktop -p "${'$'}base/color-style" -s 0 >/dev/null 2>&1 || true
+                        n=${'$'}((n + 1))
+                    done
+                    echo "DIAG: wallpaper channels patched=${'$'}n"
+                    xfdesktop --reload >/dev/null 2>&1 || pkill -USR1 -x xfdesktop >/dev/null 2>&1 || true
+                fi
+            ) &
             exec $desktopCommand
         """.trimIndent()
 
@@ -2462,6 +2513,7 @@ DROIDDESK_SH
             }
             .start()
         sessionProcess = startedSession
+        mark("session-spawned")
 
         Thread {
             try {

@@ -71,16 +71,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk 1.4.2
+          name: DroidDesk 1.4.3
           fail_on_unmatched_files: true
           files: DroidDesk-${{ github.ref_name }}-arm64.apk
           body: |
-            ## DroidDesk 1.4.2
+            ## DroidDesk 1.4.3
 
-            基于 1.4.1 继续迭代，versionCode 11，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+            基于 1.4.2 继续迭代，versionCode 12，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
-            ### 1.4.2 更新
-            - 输入法：Termux 的 GTK3 没有 IBus 输入模块，改用 AT-SPI 无障碍总线判定焦点——只有可编辑控件（text/entry/terminal 等角色）获得焦点时才请求手机系统输入法，点空白处自动收起；中文拼音组词提交后直接上屏
+            ### 1.4.3 更新
+            - 壁纸：桌面启动后按 `xfconf-query -l` 枚举实际存在的 `xfce4-desktop` last-image 通道，逐个写入壁纸并 `xfdesktop --reload`；0.75x 等缩放档位不再变纯黑
+            - 启动耗时：`startSession` 每步（bootstrap/环境整理/图形检查/profile/launcher 同步/会话总线/无障碍总线/会话拉起）与各阶段（含等待桌面）都输出 `TIMING` 打点，定位 62 秒分布
+            - 输入法：续 1.4.2 的 AT-SPI 焦点桥，保持只有可编辑控件聚焦时才请求系统输入法
+
+            ### 1.4.2 更新（沿用）
+            - 输入法：Termux 的 GTK3 没有 IBus 输入模块，改用 AT-SPI 无障碍总线判定焦点——只有可编辑控件（text/entry/terminal 等角色）获得焦点时才请求手机系统输入法，点空白处自动收起
             - 1:1 分辨率：桌面未就绪时自动清理 X 残留、socket 与锁，重试一次（只重试一次，不引入轮询看护）
             - 壁纸：为 monitorbuiltin / monitor0..3 补写 backdrop 配置，切换分辨率后不再变纯黑
 
