@@ -71,51 +71,42 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk 1.4.0
+          name: DroidDesk 1.4.1
           fail_on_unmatched_files: true
           files: DroidDesk-${{ github.ref_name }}-arm64.apk
           body: |
-            ## DroidDesk 1.4.0
+            ## DroidDesk 1.4.1
 
-            基于 1.3.3 源码（tag `v1.3.3`）继续迭代，versionCode 9，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+            基于 1.4.0 继续迭代，versionCode 10，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
-            ### 稳定性
-            - 前台服务常驻，桌面会话与 X 服务随通知常驻
-            - 崩溃/会话日志落盘（512 KiB 轮转），App 内可查看与清空
-            - 安卓 12+ 子进程限制检测：用户主动点开才检测，root 可一键放宽，无 root 给出指引
-            - 已按要求移除定时看护与自动拉起：后台由系统墓碑机制管理，不再常驻轮询
-
-            ### 软件源与安装
-            - 修复 root/chroot 下商店包管理器目标错位导致的安装失败
-            - 安装失败完整错误回显并写入日志
-            - 一键换国内镜像（清华/中科大/阿里云自动探测）
-            - 一键修复：`dpkg --configure -a`、`apt-get -f install`、刷新索引
-
-            ### 桌面外观
-            - 顶栏（应用菜单/任务列表/托盘/时钟）+ 底部 Dock（商店/终端/文件/浏览器）
-            - 触屏尺寸，可切“省电/标准”，省电档关闭合成器与动画
+            ### 启动可靠性
+            - 启动前先清理上一次会话残留（xfce4-session/panel/xfwm4/dbus、`/tmp/.xfsm-ICE-*`）
+            - 启动流程拆成阶段（清理/检查环境/挂载/启动 X/启动桌面/等待就绪），每阶段有超时，超时或异常直接回退到失败页并给出阶段与原因，不再无限转圈
+            - 加载页显示当前阶段、已用时与取消按钮；失败页可复制完整错误、重试或返回
+            - root 检测加超时；已安装 Ubuntu 但拿不到 root 时明确提示，不再静默退回 Termux 造成两种运行时混用
+            - 同一时间只允许一个会话（互斥），重复点击不会叠加启动
 
             ### 中文环境
-            - 默认 `zh_CN.UTF-8`，设置 LANG/LC_ALL/LANGUAGE
-            - 预装 Noto CJK 字体，Xft DPI 随缩放同步
-            - 默认 IBus + libpinyin 中文输入法
+            - 新增幂等的“应用中文环境”迁移：老镜像也会执行 `locale-gen zh_CN.UTF-8`、写 `/etc/default/locale` 与 `~/.xprofile`、安装 Noto CJK、初始化 IBus + libpinyin
+            - Termux 运行时不再硬编码 `LANG=en_US.UTF-8`
+            - 设置页可手动触发，结果写入日志
 
-            ### 触控板输入法
-            - 仅 X11 可编辑控件获得焦点（IBus FocusIn）时弹软键盘，失焦收起，可关闭
+            ### 软件源与安装
+            - 安装失败时展示完整 `apt-get` 输出（可复制），并写入日志
+            - 新增“诊断软件源”：架构、sources.list、resolv.conf、dpkg 锁、`dpkg --configure -a`、`apt-get update` 逐项结果
 
-            ### 桌面商店与 deb
-            - 桌面商店：搜索安装 apt 包、安装本地 .deb、一键修复软件源
-            - deb 通过系统选择器安装（root/chroot），自动补依赖并保留错误信息
-            - 自动生成桌面图标与开始菜单项
+            ### 显示
+            - 全屏改为 `WindowInsetsController` 真沉浸式，窗口尺寸/分辨率变化后重新应用
+            - 切换分辨率会完整重启桌面会话，并记录切换前后帧缓冲尺寸
 
-            ### 显示与分辨率
-            - 分辨率用户可选：跟随设备 0.5x / 0.75x（默认，省电）/ 1.0x、1:1 物理像素、1080p、2K
-            - 帧缓冲与 Surface 严格等比，最近邻过滤，不做双线性模糊
-            - 界面缩放 1.0/1.25/1.5/2.0 在桌面内部完成（Xft DPI），不拉伸像素
-            - 设置页显示当前帧缓冲分辨率、倍率与是否 1:1；切换后提示需重启会话
+            ### 输入法
+            - 改用系统输入法桥接：只有 X11 可编辑控件聚焦时才弹出手机输入法，失焦收起
 
-            ### 更新源
-            - 检查更新指向 `zhengdianqian/DroidDesk`，兼容 `v1.4.0` / `1.4.0` 标签，优先选择 arm64 APK
+            ### 日志与省电
+            - 日志同时写 `/sdcard/Android/data/com.orailnoor.droiddesk/files/logs/desktop.log`，无需 root/run-as 即可 `adb pull`
+            - 分层打点：`SESSION_START`/`MOUNT`/`X_START`/`DE_START`/`READY`/`SESSION_FAIL`/`IMEBRIDGE`/`DISPLAY`，带时间戳与耗时
+            - 设置页桌面日志支持“导出日志”分享
+            - 降低剪贴板与输入法焦点轮询频率，省电档进一步降频
 
       - name: Dump build log on failure
         if: failure()
