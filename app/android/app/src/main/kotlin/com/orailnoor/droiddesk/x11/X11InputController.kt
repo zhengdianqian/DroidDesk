@@ -71,14 +71,15 @@ class X11InputController(
 
     companion object {
         private const val KEY_MODE = "mode"
-        const val DISPLAY_SCALE_PERCENT = 150
 
-        /** Must run before LorieView is measured so Xwayland starts at the scaled resolution. */
-        fun configureDisplayScale() {
+        /**
+         * Must run before LorieView is measured: the X server takes its framebuffer size
+         * from these preferences. Defaults are physical-pixel 1:1 with nearest filtering;
+         * UI scale is applied inside the desktop through Xft DPI, not by stretching pixels.
+         */
+        fun configureDisplayScale(context: android.content.Context) {
+            com.orailnoor.droiddesk.runtime.DisplayProfile.applyToX11(context)
             MainActivity.getPrefs().apply {
-                displayResolutionMode.put("scaled")
-                displayScale.put(DISPLAY_SCALE_PERCENT)
-                displayStretch.put(true)
                 scaleTouchpad.put(true)
             }
         }

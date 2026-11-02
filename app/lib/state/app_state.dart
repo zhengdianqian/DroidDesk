@@ -61,6 +61,23 @@ class AppState extends ChangeNotifier {
   bool _autoStartDesktop = false;
   bool get autoStartDesktop => _autoStartDesktop;
 
+  // ── Desktop display & reliability ──
+  String _resolutionMode = 'native';
+  double _uiScale = 1.5;
+  String _powerMode = 'standard';
+  bool _autoIme = true;
+  Map<String, dynamic> _displayInfo = {};
+  String _desktopLog = '';
+  Map<String, dynamic> _phantomStatus = {};
+
+  String get resolutionMode => _resolutionMode;
+  double get uiScale => _uiScale;
+  String get powerMode => _powerMode;
+  bool get autoIme => _autoIme;
+  Map<String, dynamic> get displayInfo => _displayInfo;
+  String get desktopLog => _desktopLog;
+  Map<String, dynamic> get phantomStatus => _phantomStatus;
+
   // ── Getters ──
   ThemeMode get themeMode => _themeMode;
   String get language => _language;
@@ -208,6 +225,11 @@ class AppState extends ChangeNotifier {
 
     final prefs = await SharedPreferences.getInstance();
     _autoStartDesktop = prefs.getBool('autoStartDesktop') ?? false;
+    _resolutionMode = prefs.getString('ddResolutionMode') ?? 'native';
+    _uiScale = double.tryParse(prefs.getString('ddUiScale') ?? '') ?? 1.5;
+    _powerMode = prefs.getString('ddPowerMode') ?? 'standard';
+    _autoIme = prefs.getBool('ddAutoIme') ?? true;
+    await refreshDisplayInfo();
 
     if (_autoStartDesktop && isSetupComplete && !_isRunning) {
       // Auto-start desktop when the app (launcher) boots up
@@ -318,6 +340,105 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('autoStartDesktop', value);
+  }
+
+  // ── Display profile, phantom guard, desktop journal ──
+
+  /// Reads the framebuffer size the X server will actually allocate.
+  Future<void> refreshDisplayInfo() async {
+    try {
+      _displayInfo = await DroidDeskPlatform.getDisplayInfo();
+      notifyListeners();
+    } catch (_) {
+      // Frames rendered before the channel is ready can fail silently.
+    }
+  }
+
+  /// Persists one display preference; the next desktop start applies it.
+  Future<void> setDisplayProfile({
+    String? resolutionMode,
+    double? uiScale,
+    String? powerMode,
+    bool? autoIme,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (resolutionMode != null) {
+      _resolutionMode = resolutionMode;
+      await prefs.setString('ddResolutionMode', resolutionMode);
+    }
+    if (uiScale != null) {
+      _uiScale = uiScale;
+      await prefs.setString('ddUiScale', uiScale.toStringAsFixed(2));
+    }
+    if (powerMode != null) {
+      _powerMode = powerMode;
+      await prefs.setString('ddPowerMode', powerMode);
+    }
+    if (autoIme != null) {
+      _autoIme = autoIme;
+      await prefs.setBool('ddAutoIme', autoIme);
+    }
+    notifyListeners();
+    await refreshDisplayInfo();
+  }
+
+  Future<Map<String, dynamic>> refreshPhantomStatus() async {
+    try {
+      _phantomStatus = await DroidDeskPlatform.getPhantomStatus();
+      notifyListeners();
+    } catch (_) {}
+    return _phantomStatus;
+  }
+
+  Future<Map<String, dynamic>> relaxPhantomLimit() async {
+    final result = await DroidDeskPlatform.relaxPhantomLimit();
+    await refreshPhantomStatus();
+    return result;
+  }
+
+  Future<String> loadDesktopLog() async {
+    _desktopLog = await DroidDeskPlatform.getDesktopLog();
+    notifyListeners();
+    return _desktopLog;
+  }
+
+  Future<void> clearDesktopLog() async {
+    await DroidDeskPlatform.clearDesktopLog();
+    _desktopLog = '';
+    notifyListeners();
+  }
+
+  /// `dpkg --configure -a` + `--fix-broken` + a fresh index, shown in the normal
+  /// package-progress card.
+  Future<bool> repairPackageManager() async {
+    if (_activePackage != null) return false;
+    _startPackageOperation(
+      '__repair__',
+      AppStrings.t('settings.apt.repairable'),
+      const [],
+      removing: false,
+    );
+    _packageStatus = AppStrings.t('settings.apt.repairing');
+    var ok = false;
+    try {
+      ok = await DroidDeskPlatform.repairPackageManager();
+    } catch (_) {}
+    _finishPackageOperation(ok);
+    return ok;
+  }
+
+  Future<bool> applyBestMirror() async {
+    try {
+      return await DroidDeskPlatform.applyBestMirror();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>> installDebPackage() async {
+    final result = await DroidDeskPlatform.pickDebPackage();
+    if (result['ok'] == true) await refreshOptionalApps();
+    return result;
   }
 
   Future<bool> detectRootForSetup() async {

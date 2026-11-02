@@ -38,6 +38,10 @@ import com.orailnoor.droiddesk.runtime.LinuxRuntime
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
 import com.orailnoor.droiddesk.runtime.ClipboardSync
 import com.orailnoor.droiddesk.runtime.XfceMobileProfile
+import com.orailnoor.droiddesk.runtime.DisplayProfile
+import com.orailnoor.droiddesk.runtime.DesktopLog
+import com.orailnoor.droiddesk.runtime.DesktopSessionState
+import com.orailnoor.droiddesk.runtime.PhantomGuard
 import com.orailnoor.droiddesk.x11.X11ServiceClient
 import com.orailnoor.droiddesk.x11.X11InputController
 import com.orailnoor.droiddesk.runtime.AndroidAppSync
@@ -69,6 +73,11 @@ class DesktopActivity : Activity() {
     private var logoAnimator: FloatingLogoAnimator? = null
     private var surfaceCallback: SurfaceHolder.Callback? = null
     private var intentListenerThread: Thread? = null
+    private var imePollThread: Thread? = null
+    @Volatile private var imePolling = false
+    private var lastImeFocus: String? = null
+    private var desktopWatchdog: Handler? = null
+    private var crashRestartInFlight = false
     private var loadingOverlay: FrameLayout? = null
     private var loadingStatus: TextView? = null
     private var loadingEstimate: TextView? = null
@@ -119,6 +128,7 @@ class DesktopActivity : Activity() {
         private const val TAG = "DesktopActivity"
         private const val COLLAPSED_IDLE_ALPHA = 0.4f
         private const val COLLAPSED_FADE_DELAY_MS = 3_000L
+        private const val WATCHDOG_INTERVAL_MS = 5_000L
         private var current: java.lang.ref.WeakReference<DesktopActivity>? = null
 
         fun isOpen(): Boolean = current?.get()?.isFinishing == false
@@ -248,7 +258,7 @@ class DesktopActivity : Activity() {
 
     private fun setupLorieView() {
         Log.i(TAG, "Setting up LorieView")
-        X11InputController.configureDisplayScale()
+        X11InputController.configureDisplayScale(this)
         TermuxMainActivity.getInstance().initLorieView(this)
         lorieView = TermuxMainActivity.getInstance().lorieView
 
@@ -323,11 +333,85 @@ class DesktopActivity : Activity() {
         }
         addDesktopControls()
         lorieView?.requestFocus()
+        startAutoImePolling()
         if (shouldStartSession) {
             startDesktopSessionIfRequested()
         } else {
             waitForDesktopAndReveal()
         }
+    }
+
+    /**
+     * The guest's IBus watcher writes 1 only when an editable widget gains focus (GTK/Qt
+     * create an input context for text entries alone), so the soft keyboard never pops up
+     * from a plain window click. Opt-out via Settings → 自动弹出输入法.
+     */
+    private fun startAutoImePolling() {
+        if (sessionMode != "chroot" || !DisplayProfile.autoIme(this) || imePollThread != null) return
+        imePolling = true
+        imePollThread = Thread({
+            val focusFile = File(filesDir, "guest-bridge/ime-focus")
+            while (imePolling && !Thread.currentThread().isInterrupted) {
+                val value = runCatching {
+                    if (focusFile.exists()) focusFile.readText().trim() else null
+                }.getOrNull()
+                if (value != null && value != lastImeFocus && (value == "0" || value == "1")) {
+                    lastImeFocus = value
+                    runOnUiThread {
+                        if (value == "1") showKeyboard() else hideKeyboard()
+                    }
+                }
+                try {
+                    Thread.sleep(700)
+                } catch (interrupted: InterruptedException) {
+                    break
+                }
+            }
+        }, "DroidDeskAutoIme").apply { isDaemon = true }
+        imePollThread?.start()
+    }
+
+    /**
+     * Keeps watching the session process: the X server can outlive the desktop shell, leaving
+     * a frozen frame. Restarts it up to [DesktopSessionState.MAX_RESTARTS] times and records
+     * every incident in the on-device desktop log.
+     */
+    private fun startSessionWatchdog() {
+        if (desktopWatchdog != null) return
+        val handler = Handler(Looper.getMainLooper())
+        desktopWatchdog = handler
+        val check = object : Runnable {
+            override fun run() {
+                if (!desktopRevealed || isFinishing || isDestroyed) {
+                    handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+                    return
+                }
+                if (!isSessionRunning() && !crashRestartInFlight) {
+                    DesktopLog.append(this@DesktopActivity, TAG, "desktop session exited unexpectedly")
+                    if (DesktopSessionState.canRestart()) {
+                        crashRestartInFlight = true
+                        DesktopSessionState.markRestarted()
+                        Toast.makeText(
+                            this@DesktopActivity,
+                            "桌面会话已退出，正在自动恢复（第 ${DesktopSessionState.restartCount} 次）",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        handler.postDelayed({
+                            crashRestartInFlight = false
+                            if (!isSessionRunning()) restartSessionIfStopped()
+                        }, 2_000)
+                    } else {
+                        Toast.makeText(
+                            this@DesktopActivity,
+                            "桌面多次退出，已停止自动恢复。请在应用设置中查看桌面日志。",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+                handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+            }
+        }
+        handler.postDelayed(check, WATCHDOG_INTERVAL_MS)
     }
 
     private fun addDesktopControls() {
@@ -403,8 +487,8 @@ class DesktopActivity : Activity() {
             if (!desktopRevealed) visibility = View.INVISIBLE
         }
 
-        // Sit just above XFCE's bottom dock, which is scaled up with the X11 display.
-        val dockHeight = XfceMobileProfile.DOCK_SIZE_PX * X11InputController.DISPLAY_SCALE_PERCENT / 100
+        // Sit just above XFCE's bottom dock, whose height follows the in-desktop UI scale.
+        val dockHeight = XfceMobileProfile.dockHeightPx(DisplayProfile.uiScale(this))
         val overlayParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -643,6 +727,7 @@ class DesktopActivity : Activity() {
                 revealDesktop(ready)
             } catch (error: Throwable) {
                 Log.e(TAG, "Desktop session failed", error)
+                DesktopLog.append(this, TAG, "session start failed: ${error.message}")
                 revealDesktop(false)
             }
         }, "LinuxDesktopSession").start()
@@ -779,6 +864,7 @@ class DesktopActivity : Activity() {
                     collapsedControl?.visibility = View.VISIBLE
                     collapsedControl?.bringToFront()
                     lorieView?.requestFocus()
+                    startSessionWatchdog()
                 }
                 ?.start()
         }
@@ -831,6 +917,11 @@ class DesktopActivity : Activity() {
 
     override fun onDestroy() {
         collapsedFadeHandler.removeCallbacks(fadeCollapsedControl)
+        imePolling = false
+        imePollThread?.interrupt()
+        imePollThread = null
+        desktopWatchdog?.removeCallbacksAndMessages(null)
+        desktopWatchdog = null
         clipboardSync?.stop()
         clipboardSync = null
         extraKeysBar?.releaseAll()

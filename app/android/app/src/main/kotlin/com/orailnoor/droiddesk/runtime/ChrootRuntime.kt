@@ -139,10 +139,18 @@ class ChrootRuntime(private val context: Context) {
                 export NO_AT_BRIDGE=1
                 export GTK_A11Y=none
 
-                # Locale
-                export LANG=C.UTF-8
-                export LC_ALL=C.UTF-8
-                export LANGUAGE=C.UTF-8
+                # Locale — Chinese by default, with an English C.UTF-8 fallback for
+                # tools that reject a not-yet-generated locale during first boot.
+                export LANG=zh_CN.UTF-8
+                export LANGUAGE=zh_CN:zh
+                export LC_ALL=zh_CN.UTF-8
+                export LC_CTYPE=zh_CN.UTF-8
+
+                # Input method bridge (IBus) so GTK/Qt apps can type Chinese
+                export GTK_IM_MODULE=ibus
+                export QT_IM_MODULE=ibus
+                export XMODIFIERS=@im=ibus
+                export DROIDDESK_BRIDGE=/tmp/droiddesk-bridge
 
                 # Prompt
                 export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
@@ -287,6 +295,9 @@ class ChrootRuntime(private val context: Context) {
                     }
                 }
 
+                onProgress(0.7, t("正在配置中文环境与输入法…", "Configuring Chinese locale and input method..."))
+                ensureChineseEnvironment(onLog, onProgress)
+
                 onProgress(0.8, t("正在安装桌面常用软件…", "Installing Desktop Essentials tools..."))
                 if (!isPackageInstalled("htop")) {
                     val essentialsExit = execChroot(
@@ -397,9 +408,15 @@ class ChrootRuntime(private val context: Context) {
 
         // The profile is staged in app storage (see installChrootXfceMobileProfile), so its
         // version marker lives there rather than in the root-owned chroot home.
+        val uiScale = DisplayProfile.uiScale(context)
+        val powerMode = DisplayProfile.powerMode(context)
         val upgradingXfceProfile = desktopEnv == "xfce4" &&
-            XfceMobileProfile.needsInstall(File(context.cacheDir, "droiddesk-xfce-profile/root"))
-        if (desktopEnv == "xfce4") installChrootXfceMobileProfile()
+            XfceMobileProfile.needsInstall(
+                File(context.cacheDir, "droiddesk-xfce-profile/root"),
+                uiScale,
+                powerMode,
+            )
+        if (desktopEnv == "xfce4") installChrootXfceMobileProfile(uiScale, powerMode)
         if (desktopEnv == "xfce4") {
             runCatching {
                 AndroidAppBridge.syncLaunchers(
@@ -441,6 +458,12 @@ class ChrootRuntime(private val context: Context) {
             else -> desktopEnv
         }
 
+        val xftDpi = DisplayProfile.xftDpi(uiScale)
+        val cursorSize = (32.0 * XfceMobileProfile.scaleFactor(uiScale)).toInt().coerceAtLeast(24)
+        // Cheap (no apt): keeps the desktop store, .deb handler and IME watcher present
+        // even on rootfs images that were installed before this version.
+        ensureGuestScripts()
+
         val runScript = """
             # Standard FHS PATH (inherited Android PATH lacks /usr/bin)
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -478,15 +501,16 @@ class ChrootRuntime(private val context: Context) {
 
             echo "DIAG: Starting $desktopEnv in chroot on DISPLAY=:0 ..."
 
-            # ── HiDPI configuration for phone screens ──
-            # Set X resources: font DPI and cursor size
+            # ── UI scale ──
+            # The framebuffer is physical-pixel 1:1; readability comes from Xft DPI
+            # (integer UI scale), never from stretching the final image.
             cat > ~/.Xresources << 'XRES'
-Xft.dpi: 140
+Xft.dpi: $xftDpi
 Xft.antialias: 1
 Xft.hinting: 1
 Xft.hintstyle: hintslight
 Xft.rgba: rgb
-Xcursor.size: 32
+Xcursor.size: $cursorSize
 XRES
             xrdb -merge ~/.Xresources 2>/dev/null || true
             xsetroot -cursor_name left_ptr 2>/dev/null || true
@@ -504,18 +528,24 @@ XRES
             DE_BIN="$deBin"
             cat > /tmp/droiddesk-session.sh << SESSEOF
 #!/bin/bash
-# Apply HiDPI xfconf settings after xfconfd has started
+# Apply UI scale, start IBus, then the desktop. Runs on the session bus.
 (
     sleep 5
     if command -v xfconf-query >/dev/null 2>&1; then
-        xfconf-query -c xsettings -p /Xft/DPI -s 140 -n -t int 2>/dev/null || true
+        xfconf-query -c xsettings -p /Xft/DPI -s $xftDpi -n -t int 2>/dev/null || true
         xfconf-query -c xsettings -p /Net/IconThemeName -s Papirus -n -t string 2>/dev/null || true
-        xfconf-query -c xsettings -p /Gtk/FontName -s 'Sans 12' -n -t string 2>/dev/null || true
-        xfconf-query -c xsettings -p /Gtk/CursorThemeSize -s 32 -n -t int 2>/dev/null || true
+        xfconf-query -c xsettings -p /Net/CursorSize -s $cursorSize -n -t int 2>/dev/null || true
+        xfconf-query -c xsettings -p /Gtk/CursorThemeSize -s $cursorSize -n -t int 2>/dev/null || true
     fi
     # Refresh xrandr again after XFCE panels have loaded
     xrandr --auto 2>/dev/null || true
 ) &
+if command -v ibus-daemon >/dev/null 2>&1; then
+    ibus-daemon -drx >/tmp/droiddesk-ibus.log 2>&1 &
+    sleep 1
+    ibus engine libpinyin >/dev/null 2>&1 || true
+    command -v droiddesk-ime-watch >/dev/null 2>&1 && droiddesk-ime-watch >/dev/null 2>&1 &
+fi
 exec ${'$'}DE_BIN
 SESSEOF
             chmod +x /tmp/droiddesk-session.sh
@@ -533,6 +563,8 @@ SESSEOF
             .redirectErrorStream(true)
             .start()
         sessionProcess = startedSession
+        DesktopSessionState.markStarted("chroot", desktopEnv)
+        DesktopLog.append(context, TAG, "chroot session started ($desktopEnv)")
 
         Thread {
             try {
@@ -540,10 +572,15 @@ SESSEOF
                 val buffer = CharArray(1024)
                 var charsRead: Int
                 while (reader.read(buffer).also { charsRead = it } != -1) {
-                    Log.d(TAG, "CHROOT DESKTOP: " + String(buffer, 0, charsRead))
+                    val chunk = String(buffer, 0, charsRead)
+                    Log.d(TAG, "CHROOT DESKTOP: $chunk")
+                    DesktopLog.append(context, "desktop", chunk)
                 }
             } catch (error: java.io.IOException) {
                 Log.d(TAG, "Chroot desktop output stream closed")
+            } finally {
+                val exit = runCatching { startedSession.exitValue() }.getOrDefault(-1)
+                DesktopLog.append(context, TAG, "chroot session output closed (exit=$exit)")
             }
         }.start()
     }
@@ -584,7 +621,7 @@ SESSEOF
      * Ubuntu filesystem through su.  apt makes /root and /usr root-owned, so
      * writing the profile directly from Kotlin fails on real rooted devices.
      */
-    private fun installChrootXfceMobileProfile() {
+    private fun installChrootXfceMobileProfile(uiScale: Double = 1.5, powerMode: String = "standard") {
         val stagingDir = File(context.cacheDir, "droiddesk-xfce-profile")
         val stagingHome = File(stagingDir, "root")
         val stagingWallpaper = File(stagingDir, "ubuntu-touch.jpg")
@@ -595,6 +632,8 @@ SESSEOF
             homeDir = stagingHome,
             wallpaperFile = stagingWallpaper,
             wallpaperPathInSession = sessionWallpaper,
+            uiScale = uiScale,
+            powerMode = powerMode,
         )
         if (!staged) {
             Log.w(TAG, "Could not stage the XFCE mobile profile; starting with stock XFCE")
@@ -695,6 +734,8 @@ SESSEOF
             }
         }
         sessionProcess = null
+        DesktopSessionState.markStopped()
+        DesktopLog.append(context, TAG, "chroot session stopped by user")
         unmountAll()
         Log.i(TAG, "Chroot session stopped")
     }
@@ -730,6 +771,19 @@ SESSEOF
 
         // Create runtime dirs after tmpfs is mounted
         execChroot("mkdir -p /tmp/.X11-unix /tmp/runtime-root /root")
+
+        // Small host↔guest mailbox (IME focus flag, diagnostics). The guest scripts
+        // write here; the app reads the same files without needing root.
+        val bridgeHost = File(context.filesDir, "guest-bridge").apply { mkdirs() }
+        val bridgeTarget = File(rootfsDir, "tmp/droiddesk-bridge")
+        if (!mounts.any { it.contains(" on ${bridgeTarget.absolutePath} ") }) {
+            runCatching {
+                rootShell.exec(
+                    "mkdir -p ${bridgeTarget.absolutePath} && " +
+                        "mount --bind ${bridgeHost.absolutePath} ${bridgeTarget.absolutePath}",
+                )
+            }.onFailure { Log.w(TAG, "Guest bridge mount failed: ${it.message}") }
+        }
 
         // Refresh DNS — the phone's network may have changed since the
         // rootfs was first extracted. Use the resolvers Android is actually
@@ -799,6 +853,587 @@ SESSEOF
             }
         }
     }
+
+    // ── Guest Chinese environment, desktop store, and package management ──
+
+    /**
+     * Installs the Chinese locale, CJK fonts, IBus with libpinyin, and the GTK runtime used
+     * by the desktop store. Failures are reported but do not abort the whole DE install:
+     * an English desktop is better than no desktop.
+     */
+    private fun ensureChineseEnvironment(
+        onLog: (String) -> Unit = {},
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+    ) {
+        if (!isPackageInstalled("ibus") || !isPackageInstalled("fonts-noto-cjk")) {
+            onLog(t("正在下载中文字体与输入法组件…\n", "Installing CJK fonts and input method...\n"))
+            val exit = execChroot(
+                "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
+                    "locales fonts-noto-cjk fonts-noto-color-emoji ibus ibus-libpinyin ibus-gtk3 ibus-gtk4 " +
+                    "python3-gi gir1.2-gtk-3.0 dbus-x11 xdg-utils",
+                onLog,
+            )
+            if (exit != 0) {
+                execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
+                execChroot("DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y", onLog)
+            }
+        }
+
+        execChroot(
+            "locale-gen zh_CN.UTF-8 >/dev/null 2>&1 || true; " +
+                "update-locale LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh LC_ALL=zh_CN.UTF-8 >/dev/null 2>&1 || true; " +
+                "printf '%s\\n' 'LANG=zh_CN.UTF-8' 'LANGUAGE=zh_CN:zh' 'LC_ALL=zh_CN.UTF-8' > /etc/default/locale; " +
+                "fc-cache -f >/dev/null 2>&1 || true",
+            onLog,
+        )
+        ensureGuestScripts()
+        onProgress(0.75, t("中文环境已配置", "Chinese environment configured"))
+    }
+
+    /**
+     * Writes the in-guest helper programs (desktop store, .deb handler, IBus focus watcher)
+     * plus their menu entries and the .deb MIME association. The scripts are staged in app
+     * storage and copied through `su`, because /usr and /root are root-owned.
+     */
+    fun ensureGuestScripts(): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        return try {
+            val staging = File(context.cacheDir, "droiddesk-guest").apply { mkdirs() }
+            val store = File(staging, "droiddesk-store")
+            store.writeText(storeScript())
+            store.setExecutable(true, false)
+
+            val deb = File(staging, "droiddesk-install-deb")
+            deb.writeText(debInstallerScript())
+            deb.setExecutable(true, false)
+
+            val ime = File(staging, "droiddesk-ime-watch")
+            ime.writeText(imeWatcherScript())
+            ime.setExecutable(true, false)
+
+            val repair = File(staging, "droiddesk-apt-repair")
+            repair.writeText(aptRepairScript())
+            repair.setExecutable(true, false)
+
+            val storeDesktop = File(staging, "droiddesk-store.desktop")
+            storeDesktop.writeText(desktopEntry(
+                name = "软件商店 / App Store",
+                comment = "搜索并安装 apt 软件包，安装本地 .deb",
+                exec = "/usr/local/bin/droiddesk-store",
+                icon = "system-software-install",
+                categories = "System;PackageManager;",
+            ))
+            val debDesktop = File(staging, "droiddesk-deb.desktop")
+            debDesktop.writeText(desktopEntry(
+                name = "安装 Debian 软件包",
+                comment = "Install a local .deb package",
+                exec = "/usr/local/bin/droiddesk-install-deb %f",
+                icon = "application-x-deb",
+                categories = "System;PackageManager;",
+                mimeTypes = "application/vnd.debian.binary-package;",
+            ))
+            val mimeApps = File(staging, "mimeapps.list")
+            mimeApps.writeText(
+                """
+                [Default Applications]
+                application/vnd.debian.binary-package=droiddesk-deb.desktop
+                """.trimIndent() + "\n",
+            )
+
+            val commands = """
+                set -e
+                install -d -m 0755 /usr/local/bin /usr/share/applications /root/Desktop /root/.config
+                install -m 0755 ${shellQuote(store.absolutePath)} /usr/local/bin/droiddesk-store
+                install -m 0755 ${shellQuote(deb.absolutePath)} /usr/local/bin/droiddesk-install-deb
+                install -m 0755 ${shellQuote(ime.absolutePath)} /usr/local/bin/droiddesk-ime-watch
+                install -m 0755 ${shellQuote(repair.absolutePath)} /usr/local/bin/droiddesk-apt-repair
+                install -m 0644 ${shellQuote(storeDesktop.absolutePath)} /usr/share/applications/droiddesk-store.desktop
+                install -m 0644 ${shellQuote(debDesktop.absolutePath)} /usr/share/applications/droiddesk-deb.desktop
+                install -m 0755 ${shellQuote(storeDesktop.absolutePath)} /root/Desktop/droiddesk-store.desktop
+                install -m 0644 ${shellQuote(mimeApps.absolutePath)} /root/.config/mimeapps.list
+                cp -f ${shellQuote(mimeApps.absolutePath)} /etc/xdg/mimeapps.list 2>/dev/null || true
+                update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+                chown -R 0:0 /usr/local/bin/droiddesk-store /usr/local/bin/droiddesk-install-deb /usr/local/bin/droiddesk-ime-watch /usr/local/bin/droiddesk-apt-repair /root/Desktop /root/.config/mimeapps.list
+            """.trimIndent()
+            rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(commands)}")
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to install guest helper scripts", error)
+            DesktopLog.append(context, TAG, "guest scripts failed: ${error.message}")
+            false
+        }
+    }
+
+    private fun desktopEntry(
+        name: String,
+        comment: String,
+        exec: String,
+        icon: String,
+        categories: String,
+        mimeTypes: String? = null,
+    ): String = buildString {
+        append("[Desktop Entry]\n")
+        append("Type=Application\n")
+        append("Version=1.0\n")
+        append("Name=$name\n")
+        append("Comment=$comment\n")
+        append("Exec=$exec\n")
+        append("Icon=$icon\n")
+        append("Terminal=false\n")
+        append("StartupNotify=true\n")
+        append("Categories=$categories\n")
+        if (mimeTypes != null) append("MimeType=$mimeTypes\n")
+    }
+
+    /** apt-cache search inside the guest, with installed-state decoration. */
+    fun searchPackages(query: String, limit: Int = 60): List<Map<String, Any>> {
+        if (!hasRoot()) return emptyList()
+        ensureMounts()
+        val safe = query.replace(Regex("[^A-Za-z0-9+._-]"), " ").trim()
+        val command = if (safe.isEmpty()) {
+            "apt-cache search --names-only . | head -n $limit"
+        } else {
+            "apt-cache search --names-only ${shellQuote(safe)} | head -n $limit"
+        }
+        val output = executeCommand(command)
+        val installed = installedPackageSet()
+        return output.lines().mapNotNull { line ->
+            val separator = line.indexOf(" - ")
+            if (separator <= 0) return@mapNotNull null
+            val name = line.substring(0, separator).trim()
+            if (name.isEmpty()) return@mapNotNull null
+            mapOf(
+                "name" to name,
+                "description" to line.substring(separator + 3).trim(),
+                "installed" to installed.contains(name),
+                "version" to "",
+            )
+        }
+    }
+
+    fun installedPackages(limit: Int = 500): List<Map<String, Any>> {
+        if (!hasRoot()) return emptyList()
+        val output = executeCommand(
+            "dpkg-query -W -f='\${Package}|\${Version}|\${binary:Summary}\\n' 2>/dev/null | head -n $limit",
+        )
+        return output.lines().mapNotNull { line ->
+            val parts = line.split("|", limit = 3)
+            if (parts.size < 2 || parts[0].isBlank()) return@mapNotNull null
+            mapOf(
+                "name" to parts[0].trim(),
+                "version" to parts[1].trim(),
+                "description" to parts.getOrElse(2) { "" }.trim(),
+                "installed" to true,
+            )
+        }
+    }
+
+    fun upgradablePackages(refresh: Boolean): List<Map<String, Any>> {
+        if (!hasRoot()) return emptyList()
+        if (refresh) execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q")
+        val output = executeCommand("apt list --upgradable 2>/dev/null | tail -n +2")
+        return output.lines().mapNotNull { line ->
+            val name = line.substringBefore('/').trim()
+            if (name.isEmpty()) return@mapNotNull null
+            val version = Regex("upgradable from: ([^\\]]+)").find(line)?.groupValues?.get(1) ?: ""
+            mapOf("name" to name, "version" to version, "description" to "", "installed" to true)
+        }
+    }
+
+    /** Install one package, repairing a broken dpkg/apt state before retrying once. */
+    fun installPackage(
+        packageName: String,
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot() || !isSafePackageName(packageName)) return false
+        return try {
+            ensureMounts()
+            onProgress(0.05, t("正在更新软件包索引…", "Updating package index..."))
+            if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q", onLog) != 0) {
+                onLog(t("软件包索引更新失败，尝试换源后重试…\n", "apt-get update failed; trying another mirror...\n"))
+                applyBestMirror(onLog)
+            }
+            onProgress(0.2, t("正在安装 $packageName…", "Installing $packageName..."))
+            val first = execChroot(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${shellQuote(packageName)}",
+                onLog,
+            )
+            if (first == 0) {
+                onProgress(1.0, t("$packageName 安装完成", "$packageName installed"))
+                return true
+            }
+
+            onLog(t("安装失败（退出码 $first），正在自动修复依赖后重试…\n", "Install failed (exit $first); repairing and retrying...\n"))
+            repairPackageManager(onProgress, onLog)
+            val second = execChroot(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${shellQuote(packageName)}",
+                onLog,
+            )
+            val ok = second == 0
+            onProgress(if (ok) 1.0 else -1.0, if (ok) t("$packageName 安装完成", "$packageName installed") else t("$packageName 安装失败", "Failed to install $packageName"))
+            ok
+        } catch (error: Throwable) {
+            Log.e(TAG, "Package install failed: $packageName", error)
+            DesktopLog.append(context, TAG, "install $packageName failed: ${error.message}")
+            onProgress(-1.0, "安装失败：${error.message}")
+            false
+        }
+    }
+
+    fun removePackage(
+        packageName: String,
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot() || !isSafePackageName(packageName)) return false
+        val exit = execChroot(
+            "DEBIAN_FRONTEND=noninteractive apt-get remove -y ${shellQuote(packageName)}",
+            onLog,
+        )
+        onProgress(if (exit == 0) 1.0 else -1.0, if (exit == 0) "已卸载 $packageName" else "卸载失败")
+        return exit == 0
+    }
+
+    /** Upgrade every installed package inside the chroot. */
+    fun upgradeAll(
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot()) return false
+        ensureMounts()
+        onProgress(0.1, t("正在更新软件包索引…", "Updating package index..."))
+        if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update -q", onLog) != 0) {
+            applyBestMirror(onLog)
+        }
+        onProgress(0.4, t("正在升级所有软件包…", "Upgrading all packages..."))
+        val exit = execChroot(
+            "DEBIAN_FRONTEND=noninteractive apt-get -y " +
+                "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade",
+            onLog,
+        )
+        onProgress(if (exit == 0) 1.0 else -1.0, if (exit == 0) t("升级完成", "Upgrade complete") else t("升级失败", "Upgrade failed"))
+        return exit == 0
+    }
+
+    /** `dpkg --configure -a`, fix-broken, source sanity check, then a fresh index. */
+    fun repairPackageManager(
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot()) return false
+        ensureMounts()
+        try {
+            onProgress(0.1, t("正在解除 apt/dpkg 锁…", "Releasing apt/dpkg locks..."))
+            execChroot(
+                "rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; " +
+                    "dpkg --configure -a",
+                onLog,
+            )
+            onProgress(0.35, t("正在修复损坏的依赖…", "Fixing broken dependencies..."))
+            execChroot("DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y", onLog)
+
+            onProgress(0.55, t("正在检查软件源与架构…", "Checking sources and architecture..."))
+            val arch = executeCommand("dpkg --print-architecture").trim()
+            onLog("dpkg architecture: $arch\n")
+            if (arch != "arm64") {
+                onLog(t("警告：架构为 $arch，当前软件源只提供 arm64 包。\n", "Warning: architecture is $arch, but the sources target arm64.\n"))
+                val codename = MirrorSelector.detectCodename(rootfsDir)
+                val mirror = MirrorSelector.probeReachable(codename).firstOrNull()
+                    ?: "http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
+                MirrorSelector.writeSources(rootfsDir, mirror, codename)
+            }
+            // deb822 files from the stock image can re-enable the slow global mirrors.
+            listOf("ubuntu.sources", "ubuntu.sources.save").forEach { name ->
+                val file = File(rootfsDir, "etc/apt/sources.list.d/$name")
+                if (file.exists()) file.renameTo(File(file.parentFile, "$name.disabled"))
+            }
+            runCatching { DnsConfig.applyTo(rootfsDir, rootShell, L10n.isChinese(context)) { onLog(it) } }
+
+            onProgress(0.8, t("正在重新获取软件包索引…", "Refreshing package index..."))
+            val updated = execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0
+            if (!updated) applyBestMirror(onLog)
+            onProgress(1.0, t("软件源修复完成", "Package sources repaired"))
+            return updated
+        } catch (error: Throwable) {
+            Log.e(TAG, "Package manager repair failed", error)
+            DesktopLog.append(context, TAG, "repair failed: ${error.message}")
+            onProgress(-1.0, "修复失败：${error.message}")
+            return false
+        }
+    }
+
+    /** Switches the guest to the fastest reachable domestic mirror and refreshes the index. */
+    fun applyBestMirror(onLog: (String) -> Unit = {}): Boolean {
+        if (!hasRoot()) return false
+        ensureMounts()
+        val codename = MirrorSelector.detectCodename(rootfsDir)
+        val mirrors = MirrorSelector.probeReachable(codename)
+        if (mirrors.isEmpty()) {
+            onLog(t("未探测到可用的国内镜像，保留现有软件源。\n", "No reachable domestic mirror found; keeping current sources.\n"))
+            return false
+        }
+        for (mirror in mirrors) {
+            MirrorSelector.writeSources(rootfsDir, mirror, codename)
+            onLog(t("已写入镜像 $mirror，正在刷新索引…\n", "Mirror $mirror written; refreshing index...\n"))
+            if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0) {
+                onLog(t("软件源已切换到 $mirror\n", "APT mirror switched to $mirror\n"))
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Installs a .deb selected in the Android file picker, then fixes dependencies. */
+    fun installDeb(
+        hostFile: File,
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot()) return false
+        return try {
+            ensureMounts()
+            ensureGuestScripts()
+            val target = File(rootfsDir, "tmp/droiddesk-install.deb")
+            rootShell.exec(
+                "cp -f ${shellQuote(hostFile.absolutePath)} ${shellQuote(target.absolutePath)} && " +
+                    "chmod 0644 ${shellQuote(target.absolutePath)}",
+            )
+            onProgress(0.2, t("正在安装 ${hostFile.name}…", "Installing ${hostFile.name}..."))
+            val dpkgExit = execChroot("DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/droiddesk-install.deb", onLog)
+            onProgress(0.7, t("正在补齐依赖…", "Fixing dependencies..."))
+            execChroot("DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y", onLog)
+            val ok = dpkgExit == 0 || execChroot("dpkg --configure -a", onLog) == 0
+            onProgress(if (ok) 1.0 else -1.0, if (ok) "安装完成" else "安装失败，请查看日志")
+            DesktopLog.append(context, TAG, "deb install ${hostFile.name}: ok=$ok dpkg=$dpkgExit")
+            ok
+        } catch (error: Throwable) {
+            Log.e(TAG, "deb install failed", error)
+            DesktopLog.append(context, TAG, "deb install failed: ${error.message}")
+            onProgress(-1.0, "安装失败：${error.message}")
+            false
+        }
+    }
+
+    private fun installedPackageSet(): Set<String> {
+        val output = runCatching {
+            executeCommand("dpkg-query -W -f='\${db:Status-Abbrev}\${Package}\\n' 2>/dev/null")
+        }.getOrDefault("")
+        return output.lines()
+            .filter { it.startsWith("ii") }
+            .map { it.removePrefix("ii").trim() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+    }
+
+    private fun isSafePackageName(name: String): Boolean =
+        name.isNotBlank() && name.matches(Regex("[A-Za-z0-9][A-Za-z0-9+._:-]*"))
+
+    // ── Guest helper scripts ──
+
+    private fun storeScript(): String = """
+        #!/usr/bin/env python3
+        # DroidDesk App Store — search/install apt packages and local .deb files.
+        import os, subprocess, sys, threading
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk, GLib
+        except Exception:
+            subprocess.call(["bash", "-lc",
+                "apt-get install -y python3-gi gir1.2-gtk-3.0 || true"])
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        def run(cmd):
+            return subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True).stdout
+
+        class Store(Gtk.Window):
+            def __init__(self):
+                super().__init__(title="DroidDesk 软件商店")
+                self.set_default_size(520, 720)
+                self.set_border_width(12)
+                header = Gtk.HeaderBar(title="软件商店", subtitle="apt 软件包与本地 .deb")
+                header.set_show_close_button(True)
+                self.set_titlebar(header)
+
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+                self.add(box)
+
+                searchrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                self.search = Gtk.SearchEntry(placeholder_text="搜索软件包，例如 firefox、gimp")
+                self.search.set_hexpand(True)
+                self.search.connect("activate", lambda w: self.do_search(w.get_text()))
+                searchrow.pack_start(self.search, True, True, 0)
+                button = Gtk.Button(label="搜索")
+                button.connect("clicked", lambda b: self.do_search(self.search.get_text()))
+                searchrow.pack_start(button, False, False, 0)
+                box.pack_start(searchrow, False, False, 0)
+
+                actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                for label, handler in (
+                    ("安装选中", self.install_selected),
+                    ("安装 .deb", self.install_deb),
+                    ("修复软件源", self.repair),
+                ):
+                    btn = Gtk.Button(label=label)
+                    btn.connect("clicked", handler)
+                    actions.pack_start(btn, False, False, 0)
+                box.pack_start(actions, False, False, 0)
+
+                sw = Gtk.ScrolledWindow()
+                sw.set_hexpand(True)
+                sw.set_vexpand(True)
+                self.listbox = Gtk.ListBox()
+                self.listbox.connect("row-activated", lambda *a: self.install_selected(None))
+                sw.add(self.listbox)
+                box.pack_start(sw, True, True, 0)
+
+                self.status = Gtk.Label(label="输入关键字搜索；双击可直接安装。", xalign=0)
+                box.pack_start(self.status, False, False, 0)
+                self.log = Gtk.TextView(editable=False, monospace=True)
+                logsw = Gtk.ScrolledWindow()
+                logsw.set_size_request(-1, 150)
+                logsw.add(self.log)
+                box.pack_start(logsw, False, False, 0)
+
+            def append_log(self, text):
+                buf = self.log.get_buffer()
+                buf.insert(buf.get_end_iter(), text + "\n")
+                self.log.scroll_to_iter(buf.get_end_iter(), 0.0, False, 0.0, 0.0)
+
+            def spawn(self, cmd, done=None):
+                def worker():
+                    self.append_log("$ " + cmd)
+                    proc = subprocess.Popen(["bash", "-lc", cmd], stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True)
+                    for line in proc.stdout:
+                        line = line.rstrip("\n")
+                        if line:
+                            GLib.idle_add(self.append_log, line)
+                    code = proc.wait()
+                    GLib.idle_add(self.append_log, "[退出码 %d]" % code)
+                    if done:
+                        GLib.idle_add(done, code)
+                threading.Thread(target=worker, daemon=True).start()
+
+            def do_search(self, text):
+                for child in list(self.listbox.get_children()):
+                    self.listbox.remove(child)
+                text = "".join(c for c in text if c.isalnum() or c in " .+-_").strip()
+                out = run("apt-cache search --names-only %s | head -n 60" % (text or "."))
+                for line in out.splitlines():
+                    if " - " not in line:
+                        continue
+                    name, desc = line.split(" - ", 1)
+                    row = Gtk.ListBoxRow()
+                    cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                    cell.set_border_width(6)
+                    title = Gtk.Label(xalign=0, markup="<b>%s</b>" % name)
+                    cell.pack_start(title, False, False, 0)
+                    cell.pack_start(Gtk.Label(label=desc, xalign=0, wrap=True), False, False, 0)
+                    cell.pkg = name
+                    row.add(cell)
+                    self.listbox.add(row)
+                self.listbox.show_all()
+                self.status.set_text("找到 %d 个结果" % len(self.listbox.get_children()))
+
+            def selected(self):
+                row = self.listbox.get_selected_row()
+                return row.get_child().pkg if row else None
+
+            def install_selected(self, _):
+                pkg = self.selected()
+                if not pkg:
+                    self.status.set_text("请先在列表中选择一个软件包。")
+                    return
+                self.status.set_text("正在安装 " + pkg + " …")
+                self.spawn("DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends '%s'" % pkg,
+                           lambda code: self.status.set_text("安装完成" if code == 0 else "安装失败，请查看下方日志"))
+
+            def install_deb(self, _):
+                dialog = Gtk.FileChooserDialog(title="选择 .deb 文件", parent=self,
+                                               action=Gtk.FileChooserAction.OPEN)
+                dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "安装", Gtk.ResponseType.OK)
+                filt = Gtk.FileFilter()
+                filt.set_name("Debian 软件包 (*.deb)")
+                filt.add_pattern("*.deb")
+                dialog.add_filter(filt)
+                if dialog.run() == Gtk.ResponseType.OK:
+                    path = dialog.get_filename()
+                    self.status.set_text("正在安装 " + os.path.basename(path) + " …")
+                    self.spawn("dpkg -i '%s'; apt-get --fix-broken install -y" % path.replace("'", "'\\''"),
+                               lambda code: self.status.set_text("安装完成" if code == 0 else "安装失败，请查看日志"))
+                dialog.destroy()
+
+            def repair(self, _):
+                self.status.set_text("正在修复软件源…")
+                self.spawn("rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock; "
+                           "dpkg --configure -a; apt-get --fix-broken install -y; apt-get update",
+                           lambda code: self.status.set_text("修复完成" if code == 0 else "修复失败"))
+
+        win = Store()
+        win.connect("destroy", Gtk.main_quit)
+        win.show_all()
+        Gtk.main()
+    """.trimIndent() + "\n"
+
+    private fun debInstallerScript(): String = """
+        #!/bin/bash
+        # DroidDesk .deb installer: runs dpkg with full output visible in a terminal.
+        set -u
+        file="${'$'}1"
+        if [ -z "${'$'}file" ] || [ ! -f "${'$'}file" ]; then
+          echo "用法：droiddesk-install-deb <文件.deb>"
+          exit 2
+        fi
+        log=/tmp/droiddesk-deb.log
+        {
+          echo "== 正在安装 ${'$'}file =="
+          dpkg -i "${'$'}file"
+          echo "== 正在补齐依赖 =="
+          apt-get --fix-broken install -y
+          dpkg --configure -a
+        } 2>&1 | tee "${'$'}log"
+        code=${'$'}{PIPESTATUS[1]}
+        if [ "${'$'}code" -eq 0 ]; then
+          command -v notify-send >/dev/null 2>&1 && notify-send "安装完成" "${'$'}file"
+        else
+          command -v notify-send >/dev/null 2>&1 && notify-send "安装失败" "请查看 ${'$'}log"
+        fi
+        if [ -t 0 ] && [ -t 1 ]; then
+          read -r -p "按回车关闭…" _
+        else
+          xfce4-terminal --hold -e "cat ${'$'}log" >/dev/null 2>&1 &
+        fi
+        exit "${'$'}code"
+    """.trimIndent() + "\n"
+
+    private fun imeWatcherScript(): String = """
+        #!/bin/bash
+        # Writes 1 when IBus reports that an editable input context gained focus.
+        # GTK/Qt only create a context for text widgets, so this does not fire for
+        # plain window focus. Android polls this file to show the soft keyboard.
+        BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
+        mkdir -p "${'$'}BRIDGE"
+        printf '0\n' > "${'$'}BRIDGE/ime-focus"
+        dbus-monitor --session "interface='org.freedesktop.IBus.Panel'" 2>/dev/null |
+        while read -r line; do
+          case "${'$'}line" in
+            *"member=FocusIn"*)  printf '1\n' > "${'$'}BRIDGE/ime-focus" ;;
+            *"member=FocusOut"*) printf '0\n' > "${'$'}BRIDGE/ime-focus" ;;
+          esac
+        done
+    """.trimIndent() + "\n"
+
+    private fun aptRepairScript(): String = """
+        #!/bin/bash
+        # One-click apt/dpkg repair used by the desktop store and the app.
+        set -u
+        rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+        dpkg --configure -a
+        apt-get --fix-broken install -y
+        apt-get update
+    """.trimIndent() + "\n"
 
     // ── Command execution inside chroot ──
 

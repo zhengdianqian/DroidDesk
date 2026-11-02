@@ -277,10 +277,10 @@ class _DesktopToolsScreenState extends State<DesktopToolsScreen> {
                 borderRadius: BorderRadius.circular(DroidTheme.radiusMd),
                 child: child,
               ),
-              onReorderItem: (oldIndex, newIndex) {
+              onReorder: (oldIndex, newIndex) {
                 final next = [..._dockPackages];
                 final value = next.removeAt(oldIndex);
-                next.insert(newIndex, value);
+                next.insert(newIndex > oldIndex ? newIndex - 1 : newIndex, value);
                 _saveDock(next);
               },
               itemBuilder: (context, index) {

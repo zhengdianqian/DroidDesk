@@ -645,6 +645,217 @@ class HomeScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 26),
 
+                  // ── Display & scaling ──
+                  _SettingsSectionLabel(AppStrings.t('settings.section.display')),
+                  _SettingsGroup(
+                    children: [
+                      _SettingsRow(
+                        icon: Icons.aspect_ratio_rounded,
+                        color: DroidTheme.primary,
+                        title: AppStrings.t('settings.display.resolution.title'),
+                        subtitle: _resolutionSubtitle(state),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _showChoiceSheet(
+                            pageContext,
+                            title: AppStrings.t(
+                              'settings.display.resolution.title',
+                            ),
+                            options: [
+                              (
+                                'native',
+                                AppStrings.t(
+                                  'settings.display.resolution.native',
+                                ),
+                              ),
+                              (
+                                '1080p',
+                                AppStrings.t('settings.display.resolution.1080p'),
+                              ),
+                              (
+                                '1440p',
+                                AppStrings.t('settings.display.resolution.1440p'),
+                              ),
+                            ],
+                            selected: state.resolutionMode,
+                            onSelected: (value) =>
+                                state.setDisplayProfile(resolutionMode: value),
+                          );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.zoom_out_map_rounded,
+                        color: DroidTheme.secondary,
+                        title: AppStrings.t('settings.display.scale.title'),
+                        subtitle:
+                            '${state.uiScale}x · ${AppStrings.t('settings.display.scale.subtitle')}',
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _showChoiceSheet(
+                            pageContext,
+                            title: AppStrings.t('settings.display.scale.title'),
+                            options: const [
+                              ('1.00', '1.0x'),
+                              ('1.25', '1.25x'),
+                              ('1.50', '1.5x'),
+                              ('2.00', '2.0x'),
+                            ],
+                            selected: state.uiScale.toStringAsFixed(2),
+                            onSelected: (value) => state.setDisplayProfile(
+                              uiScale: double.tryParse(value) ?? 1.5,
+                            ),
+                          );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.battery_saver_rounded,
+                        color: DroidTheme.accent,
+                        title: AppStrings.t('settings.display.power.title'),
+                        subtitle: state.powerMode == 'saver'
+                            ? AppStrings.t('settings.display.power.saver')
+                            : AppStrings.t('settings.display.power.standard'),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _showChoiceSheet(
+                            pageContext,
+                            title: AppStrings.t('settings.display.power.title'),
+                            options: [
+                              (
+                                'standard',
+                                AppStrings.t('settings.display.power.standard'),
+                              ),
+                              (
+                                'saver',
+                                AppStrings.t('settings.display.power.saver'),
+                              ),
+                            ],
+                            selected: state.powerMode,
+                            onSelected: (value) =>
+                                state.setDisplayProfile(powerMode: value),
+                          );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.keyboard_rounded,
+                        color: DroidTheme.primary,
+                        title: AppStrings.t('settings.desktop.autoIme.title'),
+                        subtitle: AppStrings.t(
+                          'settings.desktop.autoIme.subtitle',
+                        ),
+                        trailing: Switch.adaptive(
+                          value: state.autoIme,
+                          activeThumbColor: Colors.white,
+                          activeTrackColor: DroidTheme.accent,
+                          inactiveThumbColor: Colors.white,
+                          inactiveTrackColor: DroidTheme.surfaceBorder,
+                          trackOutlineColor:
+                              const WidgetStatePropertyAll(Colors.transparent),
+                          onChanged: (value) =>
+                              state.setDisplayProfile(autoIme: value),
+                        ),
+                        onTap: () =>
+                            state.setDisplayProfile(autoIme: !state.autoIme),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 26),
+
+                  // ── Stability ──
+                  _SettingsSectionLabel(AppStrings.t('settings.section.stability')),
+                  _SettingsGroup(
+                    children: [
+                      _SettingsRow(
+                        icon: Icons.shield_rounded,
+                        color: DroidTheme.warning,
+                        title: AppStrings.t('settings.stability.phantom.title'),
+                        subtitle: _phantomSubtitle(state),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _showPhantomSheet(pageContext, state);
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.article_rounded,
+                        color: DroidTheme.secondary,
+                        title: AppStrings.t('settings.stability.log.title'),
+                        subtitle: AppStrings.t(
+                          'settings.stability.log.subtitle',
+                        ),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _showDesktopLog(pageContext, state);
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 26),
+
+                  // ── Apps & package sources ──
+                  _SettingsSectionLabel(AppStrings.t('settings.section.apps')),
+                  _SettingsGroup(
+                    children: [
+                      _SettingsRow(
+                        icon: Icons.swap_horiz_rounded,
+                        color: DroidTheme.primary,
+                        title: AppStrings.t('settings.apt.mirror.title'),
+                        subtitle: AppStrings.t('settings.apt.mirror.subtitle'),
+                        onTap: () async {
+                          Navigator.pop(sheetContext);
+                          final ok = await state.applyBestMirror();
+                          if (!pageContext.mounted) return;
+                          ScaffoldMessenger.of(pageContext).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppStrings.t(
+                                  ok
+                                      ? 'settings.apt.mirror.ok'
+                                      : 'settings.apt.mirror.failed',
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.build_rounded,
+                        color: DroidTheme.accent,
+                        title: AppStrings.t('settings.apt.repair.title'),
+                        subtitle: AppStrings.t('settings.apt.repair.subtitle'),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          state.repairPackageManager();
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.inventory_2_rounded,
+                        color: const Color(0xFFBF5AF2),
+                        title: AppStrings.t('settings.deb.title'),
+                        subtitle: AppStrings.t('settings.deb.subtitle'),
+                        onTap: () async {
+                          Navigator.pop(sheetContext);
+                          final result = await state.installDebPackage();
+                          if (!pageContext.mounted) return;
+                          final message = result['cancelled'] == true
+                              ? null
+                              : result['ok'] == true
+                                  ? AppStrings.t(
+                                      'settings.deb.success',
+                                      args: {
+                                        'name': result['name']?.toString() ?? '',
+                                      },
+                                    )
+                                  : result['message']?.toString() ??
+                                      AppStrings.t('settings.deb.needRoot');
+                          if (message == null) return;
+                          ScaffoldMessenger.of(pageContext).showSnackBar(
+                            SnackBar(content: Text(message)),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 26),
+
                   _SettingsSectionLabel(AppStrings.t('settings.section.system')),
                   FutureBuilder<List<bool>>(
                     future: Future.wait([
@@ -768,6 +979,201 @@ class HomeScreen extends StatelessWidget {
             ),
           );
         },
+      ),
+    );
+  }
+
+  // ── Display / stability helpers ──
+
+  String _resolutionSubtitle(AppState state) {
+    final label = switch (state.resolutionMode) {
+      '1080p' => AppStrings.t('settings.display.resolution.1080p'),
+      '1440p' => AppStrings.t('settings.display.resolution.1440p'),
+      _ => AppStrings.t('settings.display.resolution.native'),
+    };
+    final width = state.displayInfo['width'];
+    final height = state.displayInfo['height'];
+    if (width == null || height == null) return label;
+    final active = AppStrings.t(
+      'settings.display.resolution.current',
+      args: {'width': '$width', 'height': '$height'},
+    );
+    return '$label · $active';
+  }
+
+  String _phantomSubtitle(AppState state) {
+    final status = state.phantomStatus;
+    if (status.isEmpty) {
+      return AppStrings.t('settings.stability.phantom.checking');
+    }
+    if (status['needsAttention'] == true) {
+      return AppStrings.t('settings.stability.phantom.warning');
+    }
+    return AppStrings.t('settings.stability.phantom.ok');
+  }
+
+  void _showChoiceSheet(
+    BuildContext pageContext, {
+    required String title,
+    required List<(String, String)> options,
+    required String selected,
+    required ValueChanged<String> onSelected,
+  }) {
+    showModalBottomSheet(
+      context: pageContext,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => Container(
+        decoration: BoxDecoration(
+          color: DroidTheme.surface,
+          borderRadius: const BorderRadius.vertical(
+            top: Radius.circular(DroidTheme.radiusXl),
+          ),
+        ),
+        padding: EdgeInsets.fromLTRB(
+          20,
+          18,
+          20,
+          20 + MediaQuery.of(sheetContext).padding.bottom,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: DroidTheme.headingLg),
+            const SizedBox(height: 10),
+            ...options.map(
+              (option) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(option.$2),
+                trailing: option.$1 == selected
+                    ? const Icon(
+                        Icons.check_circle_rounded,
+                        color: DroidTheme.primary,
+                        size: 20,
+                      )
+                    : null,
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onSelected(option.$1);
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showPhantomSheet(BuildContext pageContext, AppState state) {
+    showModalBottomSheet(
+      context: pageContext,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          final status = state.phantomStatus;
+          final maxProcesses = status['maxPhantomProcesses']?.toString();
+          final rooted = status['rooted'] == true;
+          return Container(
+            decoration: BoxDecoration(
+              color: DroidTheme.surface,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(DroidTheme.radiusXl),
+              ),
+            ),
+            padding: EdgeInsets.fromLTRB(
+              20,
+              18,
+              20,
+              20 + MediaQuery.of(sheetContext).padding.bottom,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  AppStrings.t('settings.stability.phantom.title'),
+                  style: DroidTheme.headingLg,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  AppStrings.t('settings.stability.phantom.guide'),
+                  style: DroidTheme.bodySm,
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '${AppStrings.t('settings.stability.phantom.ok')} · '
+                  'max_phantom_processes=${maxProcesses ?? '?'}'
+                  '${rooted ? ' · root' : ''}',
+                  style: DroidTheme.bodySm,
+                ),
+                const SizedBox(height: 18),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () async {
+                      final outcome = await state.relaxPhantomLimit();
+                      if (!sheetContext.mounted) return;
+                      setSheetState(() {});
+                      ScaffoldMessenger.of(sheetContext).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            outcome['ok'] == true
+                                ? AppStrings.t(
+                                    'settings.stability.phantom.relaxed',
+                                  )
+                                : outcome['message']?.toString() ??
+                                    AppStrings.t(
+                                      'settings.stability.phantom.guide',
+                                    ),
+                          ),
+                        ),
+                      );
+                    },
+                    child: Text(
+                      AppStrings.t('settings.stability.phantom.relax'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _showDesktopLog(BuildContext pageContext, AppState state) async {
+    await state.loadDesktopLog();
+    if (!pageContext.mounted) return;
+    await showDialog<void>(
+      context: pageContext,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(AppStrings.t('settings.stability.log.title')),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 360,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              state.desktopLog.isEmpty
+                  ? AppStrings.t('settings.stability.log.empty')
+                  : state.desktopLog,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await state.clearDesktopLog();
+              if (dialogContext.mounted) Navigator.pop(dialogContext);
+            },
+            child: Text(AppStrings.t('settings.stability.log.clear')),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(AppStrings.t('common.goBack')),
+          ),
+        ],
       ),
     );
   }

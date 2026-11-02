@@ -17,6 +17,8 @@ import com.orailnoor.droiddesk.MainActivity
 import com.orailnoor.droiddesk.runtime.AndroidAppBridge
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
 import com.orailnoor.droiddesk.runtime.LinuxRuntime
+import com.orailnoor.droiddesk.runtime.DesktopLog
+import com.orailnoor.droiddesk.runtime.DesktopSessionState
 import com.orailnoor.droiddesk.view.DesktopActivity
 import com.orailnoor.droiddesk.x11.X11ServerService
 import kotlin.concurrent.thread
@@ -34,17 +36,60 @@ class DroidDeskService : Service() {
         const val CHANNEL_ID = "droiddesk_service"
         const val NOTIFICATION_ID = 1001
         private const val TAG = "DroidDeskService"
+        private const val WATCHDOG_INTERVAL_MS = 30_000L
         private const val ACTION_STOP = "com.orailnoor.droiddesk.action.STOP_DESKTOP"
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var stopping = false
 
+    private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!stopping) checkSessionAlive()
+            watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         AndroidAppBridge.start(this)
         createNotificationChannel()
         acquireWakeLock()
+        watchdogHandler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS)
+    }
+
+    /**
+     * Android 12+ reaps background children (phantom-process killer), and even without it the
+     * chroot shell can die while the app is in the background. When the desktop screen is gone
+     * and the session was expected to survive, start it again a few times and journal the event.
+     */
+    private fun checkSessionAlive() {
+        if (!DesktopSessionState.expectedRunning) return
+        if (DesktopActivity.isOpen()) return
+        val chroot = ChrootRuntime(this)
+        val running = chroot.isRunning() || LinuxRuntime(this).isRunning()
+        if (running) return
+        if (!DesktopSessionState.canRestart()) {
+            DesktopLog.append(this, "service", "session gone and restart budget exhausted")
+            updateNotification("Linux 桌面已停止（自动恢复次数已用尽，请查看桌面日志）")
+            return
+        }
+        DesktopSessionState.markRestarted()
+        DesktopLog.append(
+            this, "service",
+            "session vanished; restart #${DesktopSessionState.restartCount} (mode=${DesktopSessionState.mode})",
+        )
+        updateNotification("正在恢复 Linux 桌面（第 ${DesktopSessionState.restartCount} 次）")
+        thread(name = "watchdog-restart-linux") {
+            runCatching {
+                if (DesktopSessionState.mode == "chroot") {
+                    chroot.startSession(DesktopSessionState.desktopEnv)
+                } else {
+                    LinuxRuntime(this).startSession(DesktopSessionState.desktopEnv, "x11")
+                }
+            }.onFailure { Log.e(TAG, "Watchdog could not restart the session", it) }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,6 +116,7 @@ class DroidDeskService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        watchdogHandler.removeCallbacksAndMessages(null)
         AndroidAppBridge.stop()
         releaseWakeLock()
         super.onDestroy()

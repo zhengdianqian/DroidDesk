@@ -18,6 +18,10 @@ import com.orailnoor.droiddesk.runtime.RootShell
 import com.orailnoor.droiddesk.runtime.AndroidAppBridge
 import com.orailnoor.droiddesk.runtime.AppUpdater
 import com.orailnoor.droiddesk.runtime.DesktopIntegration
+import com.orailnoor.droiddesk.runtime.DisplayProfile
+import com.orailnoor.droiddesk.runtime.DesktopLog
+import com.orailnoor.droiddesk.runtime.DesktopSessionState
+import com.orailnoor.droiddesk.runtime.PhantomGuard
 import com.orailnoor.droiddesk.view.AndroidSurfaceViewFactory
 import com.orailnoor.droiddesk.x11.X11ServerService
 import kotlin.concurrent.thread
@@ -31,6 +35,7 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "MainActivity"
         /** Sent by the "Open" notification action: show the desktop, resuming a running session. */
         const val ACTION_OPEN_DESKTOP = "com.orailnoor.droiddesk.action.OPEN_DESKTOP"
+        private const val DEB_PICK_REQUEST = 4021
         private val packageOperationRunning = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 
@@ -40,6 +45,8 @@ class MainActivity : FlutterActivity() {
     private lateinit var linuxRuntime: LinuxRuntime
     private lateinit var chrootRuntime: ChrootRuntime
     private lateinit var desktopIntegration: DesktopIntegration
+    /** Result of the .deb file picker, answered in onActivityResult. */
+    private var pendingDebResult: MethodChannel.Result? = null
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val logBuffer = StringBuffer()
@@ -88,6 +95,65 @@ class MainActivity : FlutterActivity() {
         }
         handleHomeLaunch(intent)
         maybeAutoStartDesktop(intent)
+    }
+
+    /**
+     * Copies the picked .deb into app storage and hands it to the guest installer. The system
+     * picker grants a temporary read URI, which the chroot cannot open directly.
+     */
+    @Deprecated("FlutterActivity still delivers the document picker through onActivityResult")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != DEB_PICK_REQUEST) return
+        val pending = pendingDebResult
+        pendingDebResult = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            pending?.success(mapOf("ok" to false, "cancelled" to true, "message" to "已取消选择"))
+            return
+        }
+        val displayName = runCatching {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+            }
+        }.getOrNull() ?: "droiddesk-install.deb"
+        installThread("install-deb") {
+            val messenger = flutterEngine?.dartExecutor?.binaryMessenger
+            val progress: (Double, String) -> Unit = { value, status ->
+                if (messenger != null) runOnUiThread {
+                    MethodChannel(messenger, CHANNEL).invokeMethod(
+                        "onPackageOperationProgress",
+                        mapOf("progress" to value, "status" to status),
+                    )
+                }
+            }
+            val log: (String) -> Unit = { chunk ->
+                if (messenger != null) runOnUiThread {
+                    MethodChannel(messenger, CHANNEL).invokeMethod(
+                        "onPackageOperationLog", mapOf("text" to chunk),
+                    )
+                }
+            }
+            val outcome = try {
+                val target = java.io.File(cacheDir, "droiddesk-install.deb").apply {
+                    parentFile?.mkdirs()
+                }
+                contentResolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use(input::copyTo)
+                } ?: throw java.io.IOException("无法读取所选文件")
+                if (!chrootRuntime.hasRoot()) {
+                    mapOf("ok" to false, "message" to "deb 安装需要 root（chroot 运行时）")
+                } else {
+                    val ok = chrootRuntime.installDeb(target, progress, log)
+                    mapOf("ok" to ok, "name" to displayName)
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "deb install failed", error)
+                mapOf("ok" to false, "message" to (error.message ?: "deb 安装失败"))
+            }
+            runOnUiThread { pending?.success(outcome) }
+        }
     }
 
     /** Optional "Auto-Start Linux Desktop" setting: open the chroot desktop whenever the app starts. */
@@ -492,14 +558,22 @@ class MainActivity : FlutterActivity() {
                     val query = call.argument<String>("query") ?: ""
                     val limit = call.argument<Int>("limit") ?: 60
                     thread(name = "package-search") {
-                        val packages = linuxRuntime.searchNativePackages(query, limit)
+                        val packages = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.searchPackages(query, limit)
+                        } else {
+                            linuxRuntime.searchNativePackages(query, limit)
+                        }
                         runOnUiThread { result.success(packages) }
                     }
                 }
 
                 "getInstalledNativePackages" -> {
                     thread(name = "installed-packages") {
-                        val packages = linuxRuntime.getInstalledNativePackages()
+                        val packages = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.installedPackages()
+                        } else {
+                            linuxRuntime.getInstalledNativePackages()
+                        }
                         runOnUiThread { result.success(packages) }
                     }
                 }
@@ -512,27 +586,59 @@ class MainActivity : FlutterActivity() {
                 "getUpgradablePackages" -> {
                     val refresh = call.argument<Boolean>("refresh") ?: false
                     thread(name = "upgradable-packages") {
-                        val packages = runCatching { linuxRuntime.getUpgradablePackages(refresh) }
-                            .getOrDefault(emptyList())
+                        val packages = runCatching {
+                            if (chrootRuntime.hasRoot()) chrootRuntime.upgradablePackages(refresh)
+                            else linuxRuntime.getUpgradablePackages(refresh)
+                        }.getOrDefault(emptyList())
                         runOnUiThread { result.success(packages) }
                     }
                 }
 
-                "upgradeAllPackages" -> runPackageOperation(
-                    flutterEngine, result, "updates", remove = false,
-                ) { progress -> linuxRuntime.upgradeAllPackages(progress) }
+                "upgradeAllPackages" -> {
+                    val rooted = chrootRuntime.hasRoot()
+                    runPackageOperation(
+                        flutterEngine, result, "updates", remove = false,
+                    ) { progress ->
+                        if (rooted) {
+                            chrootRuntime.upgradeAll(progress) { chunk ->
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onPackageOperationLog", mapOf("text" to chunk))
+                            }
+                        } else {
+                            linuxRuntime.upgradeAllPackages(progress)
+                        }
+                    }
+                }
 
                 "getStorageInfo" -> {
                     thread(name = "storage-info") {
-                        val info = runCatching { linuxRuntime.getStorageInfo() }
-                            .getOrDefault(emptyMap())
+                        val info = if (chrootRuntime.hasRoot()) {
+                            val stat = android.os.StatFs(filesDir.absolutePath)
+                            mapOf<String, Any>(
+                                "deviceFree" to stat.availableBytes,
+                                "deviceTotal" to stat.totalBytes,
+                                "system" to 0L,
+                                "home" to 0L,
+                                "cache" to 0L,
+                                "available" to true,
+                            )
+                        } else {
+                            runCatching { linuxRuntime.getStorageInfo() }.getOrDefault(emptyMap())
+                        }
                         runOnUiThread { result.success(info) }
                     }
                 }
 
                 "cleanPackageCache" -> {
                     thread(name = "clean-package-cache") {
-                        val freed = runCatching { linuxRuntime.cleanPackageCache() }.getOrDefault(-1L)
+                        val freed = if (chrootRuntime.hasRoot()) {
+                            runCatching {
+                                chrootRuntime.executeCommand("apt-get clean; rm -rf /var/lib/apt/lists/*")
+                                0L
+                            }.getOrDefault(-1L)
+                        } else {
+                            runCatching { linuxRuntime.cleanPackageCache() }.getOrDefault(-1L)
+                        }
                         runOnUiThread { result.success(freed) }
                     }
                 }
@@ -742,14 +848,11 @@ class MainActivity : FlutterActivity() {
                 "startLinux" -> {
                     val desktopEnv = call.argument<String>("de") ?: "xfce4"
                     val mode = call.argument<String>("mode") ?: "x11"
-                    var width = call.argument<Int>("width") ?: 1920
-                    var height = call.argument<Int>("height") ?: 1080
-
-                    if (height > 1080) {
-                        val scale = 1080.0 / height
-                        width = (width * scale).toInt()
-                        height = 1080
-                    }
+                    // Sizes are advisory: the X server uses DisplayProfile (physical pixels
+                    // by default) before LorieView is measured. Never downscale here.
+                    val display = com.orailnoor.droiddesk.runtime.DisplayProfile.effectiveSize(this)
+                    val width = call.argument<Int>("width") ?: display.x
+                    val height = call.argument<Int>("height") ?: display.y
 
                     startForegroundService()
 
@@ -905,6 +1008,108 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                // ── Display profile: physical-pixel 1:1 framebuffer + in-desktop UI scale ──
+                "getDisplayInfo" -> result.success(DisplayProfile.info(this))
+
+                // ── Android 12+ phantom-process killer ──
+                "getPhantomStatus" -> thread(name = "phantom-status") {
+                    val status = PhantomGuard.status(this)
+                    runOnUiThread { result.success(status) }
+                }
+
+                "relaxPhantomLimit" -> thread(name = "phantom-relax") {
+                    val outcome = PhantomGuard.relax(this)
+                    runOnUiThread { result.success(outcome) }
+                }
+
+                // ── Desktop crash journal ──
+                "getDesktopLog" -> thread(name = "desktop-log") {
+                    val text = DesktopLog.read(this)
+                    runOnUiThread { result.success(text) }
+                }
+
+                "clearDesktopLog" -> {
+                    DesktopLog.clear(this)
+                    result.success(true)
+                }
+
+                "getSessionState" -> result.success(
+                    mapOf(
+                        "expectedRunning" to DesktopSessionState.expectedRunning,
+                        "restartCount" to DesktopSessionState.restartCount,
+                        "mode" to DesktopSessionState.mode,
+                    ),
+                )
+
+                // ── APT maintenance (works in both chroot and native runtimes) ──
+                "repairPackageManager" -> {
+                    val messenger = flutterEngine.dartExecutor.binaryMessenger
+                    installThread("apt-repair") {
+                        val rooted = chrootRuntime.hasRoot()
+                        val progress: (Double, String) -> Unit = { value, status ->
+                            runOnUiThread {
+                                MethodChannel(messenger, CHANNEL).invokeMethod(
+                                    "onPackageOperationProgress",
+                                    mapOf("progress" to value, "status" to status),
+                                )
+                            }
+                        }
+                        val log: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(messenger, CHANNEL).invokeMethod(
+                                    "onPackageOperationLog", mapOf("text" to chunk),
+                                )
+                            }
+                        }
+                        val ok = if (rooted) {
+                            chrootRuntime.repairPackageManager(progress, log)
+                        } else {
+                            progress(0.05, "正在修复软件包管理器…")
+                            val output = linuxRuntime.executeCommand(
+                                "dpkg --configure -a; apt-get --fix-broken install -y; apt-get update", log,
+                            )
+                            progress(1.0, "修复命令执行完毕")
+                            !output.contains("E: ")
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "applyBestMirror" -> {
+                    val messenger = flutterEngine.dartExecutor.binaryMessenger
+                    installThread("apt-mirror") {
+                        val log: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(messenger, CHANNEL).invokeMethod(
+                                    "onPackageOperationLog", mapOf("text" to chunk),
+                                )
+                            }
+                        }
+                        val ok = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.applyBestMirror(log)
+                        } else {
+                            // The native runtime uses Termux repositories, not Ubuntu ports.
+                            false
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "pickDebPackage" -> {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(
+                            Intent.EXTRA_MIME_TYPES,
+                            arrayOf("application/vnd.debian.binary-package", "application/octet-stream"),
+                        )
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    pendingDebResult = result
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(intent, DEB_PICK_REQUEST)
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -993,8 +1198,9 @@ class MainActivity : FlutterActivity() {
             return
         }
         installThread(if (remove) "package-remove" else "package-install") {
-            linuxRuntime.beginPackageOperation()
-            linuxRuntime.setInstallLogSink { chunk ->
+            val rooted = chrootRuntime.hasRoot()
+            if (!rooted) linuxRuntime.beginPackageOperation()
+            val logSink: (String) -> Unit = { chunk ->
                 runOnUiThread {
                     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod(
                         "onPackageOperationLog",
@@ -1002,6 +1208,7 @@ class MainActivity : FlutterActivity() {
                     )
                 }
             }
+            if (!rooted) linuxRuntime.setInstallLogSink(logSink)
             val progress: (Double, String) -> Unit = { value, status ->
                 runOnUiThread {
                     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod(
@@ -1012,21 +1219,27 @@ class MainActivity : FlutterActivity() {
             }
             try {
                 startForegroundService()
-                val ok = if (operation != null) {
-                    operation(progress)
-                } else if (remove) {
-                    linuxRuntime.removeStorePackage(packageName, progress)
-                } else {
-                    linuxRuntime.installStorePackage(packageName, progress)
+                // Rooted devices install inside the Ubuntu chroot; the native runtime owns
+                // the app-private Termux tree. Branching here is what previously made the
+                // store fail on rooted devices: it always targeted linuxRuntime.
+                val ok = when {
+                    operation != null -> operation(progress)
+                    rooted && remove -> chrootRuntime.removePackage(packageName, progress, logSink)
+                    rooted -> chrootRuntime.installPackage(packageName, progress, logSink)
+                    remove -> linuxRuntime.removeStorePackage(packageName, progress)
+                    else -> linuxRuntime.installStorePackage(packageName, progress)
                 }
                 runOnUiThread { result.success(ok) }
             } catch (error: Throwable) {
                 Log.e(TAG, "Package operation failed for $packageName", error)
+                DesktopLog.append(this, "package", "operation $packageName failed: ${error.message}")
                 progress(-1.0, error.message ?: "Package operation failed")
                 runOnUiThread { result.success(false) }
             } finally {
-                linuxRuntime.setInstallLogSink(null)
-                linuxRuntime.finishPackageOperation()
+                if (!rooted) {
+                    linuxRuntime.setInstallLogSink(null)
+                    linuxRuntime.finishPackageOperation()
+                }
                 packageOperationRunning.set(false)
             }
         }

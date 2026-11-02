@@ -420,4 +420,68 @@ class DroidDeskPlatform {
   static Future<bool> isDefaultLauncher() async {
     return await _channel.invokeMethod<bool>('isDefaultLauncher') ?? false;
   }
+
+  // ── Display profile (physical-pixel 1:1 + in-desktop UI scale) ──
+
+  /// Effective framebuffer size, preset mode, UI scale, Xft DPI and 1:1 state.
+  static Future<Map<String, dynamic>> getDisplayInfo() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getDisplayInfo',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
+
+  // ── Android 12+ phantom-process killer ──
+
+  static Future<Map<String, dynamic>> getPhantomStatus() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getPhantomStatus',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
+
+  /// Root only: relax the child-process cap; otherwise returns guidance text.
+  static Future<Map<String, dynamic>> relaxPhantomLimit() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'relaxPhantomLimit',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
+
+  // ── Desktop crash journal ──
+
+  static Future<String> getDesktopLog() async {
+    return await _channel.invokeMethod<String>('getDesktopLog') ?? '';
+  }
+
+  static Future<void> clearDesktopLog() async {
+    await _channel.invokeMethod('clearDesktopLog');
+  }
+
+  static Future<Map<String, dynamic>> getSessionState() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getSessionState',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
+
+  // ── APT maintenance ──
+
+  /// `dpkg --configure -a`, `--fix-broken`, arch/source checks, then `apt-get update`.
+  static Future<bool> repairPackageManager() async {
+    return await _channel.invokeMethod<bool>('repairPackageManager') ?? false;
+  }
+
+  /// Switches the guest to the fastest reachable domestic Ubuntu mirror.
+  static Future<bool> applyBestMirror() async {
+    return await _channel.invokeMethod<bool>('applyBestMirror') ?? false;
+  }
+
+  /// Opens the Android file picker, then installs the chosen .deb in the guest.
+  static Future<Map<String, dynamic>> pickDebPackage() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'pickDebPackage',
+    );
+    return result == null ? {} : Map<String, dynamic>.from(result);
+  }
 }
