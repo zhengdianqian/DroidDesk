@@ -1271,9 +1271,9 @@ class DesktopActivity : Activity() {
  * typed twice.
  */
 private class GuestImeAnchor(
-    context: android.content.Context,
+    private val ctx: android.content.Context,
     private val target: () -> LorieView?,
-) : EditText(context) {
+) : EditText(ctx) {
     init {
         alpha = 0f
         background = null
@@ -1290,7 +1290,7 @@ private class GuestImeAnchor(
         outAttrs.imeOptions = outAttrs.imeOptions or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : InputConnectionWrapper(base, false) {
-            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            private fun commitToX(text: CharSequence?): Boolean {
                 val value = text?.toString().orEmpty()
                 if (value == "\n" || value == "\r\n") {
                     forwardKey(KeyEvent.KEYCODE_ENTER)
@@ -1299,8 +1299,24 @@ private class GuestImeAnchor(
                 }
                 // Keep the anchor itself empty; it is not a visible editor.
                 super.commitText("", 1)
+                if (value.isNotEmpty()) {
+                    DesktopLog.append(ctx, "IMEBRIDGE", "commit ${value.length} chars")
+                }
                 return true
             }
+
+            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                return commitToX(text)
+            }
+
+            // Android 13+ IMEs (including the Chinese keyboards users run here) call the
+            // three-argument overload. Without this override committed characters stayed
+            // inside the invisible anchor and never reached the X session.
+            override fun commitText(
+                text: CharSequence,
+                newCursorPosition: Int,
+                textAttribute: android.view.inputmethod.TextAttribute?,
+            ): Boolean = commitToX(text)
 
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 // Composing (pinyin preview) is rendered by the IME alone.
