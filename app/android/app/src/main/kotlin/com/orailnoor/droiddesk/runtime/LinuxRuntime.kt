@@ -2232,9 +2232,12 @@ class LinuxRuntime(private val context: Context) {
         val desktopCommand = "xfce4-session"
 
         val runScript = """
-            # ── Disable AT-SPI accessibility bus ──
-            export NO_AT_BRIDGE=1
-            export GTK_A11Y=none
+            # ── AT-SPI accessibility bus (used by the Android IME bridge) ──
+            # It must stay enabled: Termux's GTK3 has no IBus input module, so focus
+            # state is read from at-spi instead of from an input context.
+            unset NO_AT_BRIDGE
+            unset GTK_A11Y
+            export GTK_MODULES=gail:atk-bridge
             export DISPLAY=:0
 
             # Use the session bus DroidDesk already started
@@ -2271,25 +2274,79 @@ class LinuxRuntime(private val context: Context) {
             fi
             echo "DIAG: PulseAudio sinks: ${'$'}(limit 2 pactl list short sinks 2>/dev/null | cut -f2 | tr '\n' ' ')"
 
-            # IBus must exist before GTK/Qt create input contexts; XFCE autostart is
-            # unreliable on relocated prefixes, so start it explicitly.
-            if command -v ibus-daemon >/dev/null 2>&1; then
-                pkill -9 -x ibus-daemon >/dev/null 2>&1 || true
-                limit 10 ibus-daemon -drx >/dev/null 2>&1 || true
-            fi
-
-            # Android IME bridge: 1 only while an editable widget holds IBus focus.
+            # Android IME bridge. The IME is only requested while an EDITABLE widget
+            # (text/entry/terminal/...) holds focus, so tapping a window background or
+            # the desktop never pops the keyboard. Focus comes from the AT-SPI
+            # accessibility bus: GTK3 (XFCE, VTE terminal) and Qt both report it there,
+            # which is why this works without an IBus input module.
             BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
             mkdir -p "${'$'}BRIDGE" 2>/dev/null || true
             printf '0\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null || true
-            if command -v dbus-monitor >/dev/null 2>&1; then
-                ( dbus-monitor --session "interface='org.freedesktop.IBus.Panel'" 2>/dev/null |
-                  while read -r line; do
-                    case "${'$'}line" in
-                      *"member=FocusIn"*)  printf '1\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null ;;
-                      *"member=FocusOut"*) printf '0\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null ;;
-                    esac
-                  done ) &
+            # PyGObject is not installed in this bootstrap, so the watcher talks to the
+            # AT-SPI bus with dbus-send/dbus-monitor directly. Only roles that accept text
+            # (38 password text, 56 terminal, 57 text, 69 paragraph) count as editable.
+            cat > "${'$'}BRIDGE/ime-watch.sh" <<'DROIDDESK_SH'
+#!/system/bin/sh
+BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
+FOCUS="${'$'}BRIDGE/ime-focus"
+ROLE="${'$'}BRIDGE/ime-role"
+LAST="none"
+write_state() {
+    if [ "${'$'}LAST" != "${'$'}1" ]; then
+        LAST="${'$'}1"
+        printf '%s\n' "${'$'}1" > "${'$'}FOCUS" 2>/dev/null || true
+    fi
+}
+ADDR=""
+i=0
+while [ "${'$'}i" -lt 30 ]; do
+    ADDR="${'$'}(dbus-send --session --print-reply --dest=org.a11y.Bus \
+        /org/a11y/bus org.a11y.Bus.GetAddress 2>/dev/null |
+        sed -n 's/^ *string "\(.*\)"${'$'}/\1/p')"
+    [ -n "${'$'}ADDR" ] && break
+    i=${'$'}((i + 1))
+    sleep 1
+done
+if [ -z "${'$'}ADDR" ]; then
+    echo "watcher-error:no-a11y-bus" > "${'$'}ROLE" 2>/dev/null || true
+    exit 0
+fi
+echo "DIAG: a11y bus ${'$'}ADDR"
+dbus-monitor --address="${'$'}ADDR" \
+    "type=signal,interface=org.a11y.atspi.Event.Object,member=StateChanged" 2>/dev/null |
+awk '
+/^signal/ {
+    sender=""; path=""; detail=-1; focused=0
+    if (match($0, /sender=[^ ]+/)) sender=substr($0, RSTART+7, RLENGTH-7)
+    if (match($0, /path=[^ ]+/)) path=substr($0, RSTART+5, RLENGTH-5)
+    for (i=0; i<8; i++) {
+        if ((getline line) <= 0) break
+        if (line ~ /string "focused"/) focused=1
+        if (line ~ /^   int32 0${'$'}/) detail=0
+        if (line ~ /^   int32 1${'$'}/) detail=1
+    }
+    if (focused==1 && path!="") print sender "|" path "|" detail
+}' |
+while IFS='|' read -r sender path detail; do
+    [ -z "${'$'}path" ] && continue
+    if [ "${'$'}detail" = "0" ]; then
+        write_state 0
+        continue
+    fi
+    role="${'$'}(dbus-send --address="${'$'}ADDR" --print-reply --dest="${'$'}sender "${'$'}path" \
+        org.a11y.atspi.Accessible.GetRole 2>/dev/null | awk '/uint32/ {print ${'$'}2; exit}')"
+    printf '%s\n' "${'$'}{role:-?}" > "${'$'}ROLE" 2>/dev/null || true
+    case "${'$'}role" in
+        38|56|57|69) write_state 1 ;;
+        *) write_state 0 ;;
+    esac
+done
+DROIDDESK_SH
+            if command -v dbus-monitor >/dev/null 2>&1 && command -v dbus-send >/dev/null 2>&1; then
+                ( sh "${'$'}BRIDGE/ime-watch.sh" >/dev/null 2>&1 ) &
+                echo "DIAG: at-spi ime watcher started"
+            else
+                echo "DIAG: dbus tools missing, ime watcher disabled"
             fi
 
             echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."

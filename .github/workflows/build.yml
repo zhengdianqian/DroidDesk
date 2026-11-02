@@ -71,13 +71,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk 1.4.1
+          name: DroidDesk 1.4.2
           fail_on_unmatched_files: true
           files: DroidDesk-${{ github.ref_name }}-arm64.apk
           body: |
-            ## DroidDesk 1.4.1
+            ## DroidDesk 1.4.2
 
-            基于 1.4.0 继续迭代，versionCode 10，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+            基于 1.4.1 继续迭代，versionCode 11，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+
+            ### 1.4.2 更新
+            - 输入法：Termux 的 GTK3 没有 IBus 输入模块，改用 AT-SPI 无障碍总线判定焦点——只有可编辑控件（text/entry/terminal 等角色）获得焦点时才请求手机系统输入法，点空白处自动收起；中文拼音组词提交后直接上屏
+            - 1:1 分辨率：桌面未就绪时自动清理 X 残留、socket 与锁，重试一次（只重试一次，不引入轮询看护）
+            - 壁纸：为 monitorbuiltin / monitor0..3 补写 backdrop 配置，切换分辨率后不再变纯黑
 
             ### 启动可靠性
             - 启动前先清理上一次会话残留（xfce4-session/panel/xfwm4/dbus、`/tmp/.xfsm-ICE-*`）

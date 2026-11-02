@@ -17,7 +17,7 @@ import kotlin.math.roundToInt
  */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_VERSION = "v15"
+    private const val PROFILE_VERSION = "v16"
     private const val MONOSPACE_FONT = "DejaVu Sans Mono"
     private const val WALLPAPER_ASSET = "droiddesk/sunset-wave-wallpaper.jpg"
 
@@ -437,34 +437,45 @@ object XfceMobileProfile {
         """.trimIndent() + "\n"
     }
 
-    private fun desktopConfig(wallpaperPath: String, s: Double): String = """
-        <?xml version="1.1" encoding="UTF-8"?>
-
-        <channel name="xfce4-desktop" version="1.0">
-          <property name="last-settings-migration-version" type="uint" value="1"/>
-          <property name="backdrop" type="empty">
-            <property name="screen0" type="empty">
-              <property name="monitorbuiltin" type="empty">
-                <property name="workspace0" type="empty">
-                  <property name="color-style" type="int" value="0"/>
-                  <property name="image-style" type="int" value="5"/>
-                  <property name="last-image" type="string" value="$wallpaperPath"/>
-                </property>
+    private fun desktopConfig(wallpaperPath: String, s: Double): String {
+        // xfdesktop names its backdrop "monitorbuiltin" on some ROMs and "monitor0..N"
+        // on others, and the name can change with the framebuffer size. Writing only
+        // one of them left the desktop pure black after a resolution switch.
+        val monitors = listOf("monitorbuiltin", "monitor0", "monitor1", "monitor2", "monitor3")
+        val backdrops = monitors.joinToString("\n") { name ->
+            """
+            <property name="$name" type="empty">
+              <property name="workspace0" type="empty">
+                <property name="color-style" type="int" value="0"/>
+                <property name="image-style" type="int" value="5"/>
+                <property name="last-image" type="string" value="$wallpaperPath"/>
               </property>
             </property>
-          </property>
-          <property name="desktop-icons" type="empty">
-            <property name="style" type="int" value="1"/>
-            <property name="icon-size" type="uint" value="${(72 * s).roundToInt()}"/>
-            <property name="file-icons" type="empty">
-              <property name="show-home" type="bool" value="false"/>
-              <property name="show-filesystem" type="bool" value="false"/>
-              <property name="show-trash" type="bool" value="false"/>
-              <property name="show-removable" type="bool" value="false"/>
-            </property>
-          </property>
-        </channel>
-    """.trimIndent() + "\n"
+            """.trimIndent()
+        }
+        return """
+            <?xml version="1.1" encoding="UTF-8"?>
+
+            <channel name="xfce4-desktop" version="1.0">
+              <property name="last-settings-migration-version" type="uint" value="1"/>
+              <property name="backdrop" type="empty">
+                <property name="screen0" type="empty">
+            $backdrops
+                </property>
+              </property>
+              <property name="desktop-icons" type="empty">
+                <property name="style" type="int" value="1"/>
+                <property name="icon-size" type="uint" value="${(72 * s).roundToInt()}"/>
+                <property name="file-icons" type="empty">
+                  <property name="show-home" type="bool" value="false"/>
+                  <property name="show-filesystem" type="bool" value="false"/>
+                  <property name="show-trash" type="bool" value="false"/>
+                  <property name="show-removable" type="bool" value="false"/>
+                </property>
+              </property>
+            </channel>
+        """.trimIndent() + "\n"
+    }
 
     private fun xmlEscape(value: String): String = value
         .replace("&", "&amp;")

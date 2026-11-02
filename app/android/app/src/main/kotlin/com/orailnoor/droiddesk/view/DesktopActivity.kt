@@ -841,12 +841,25 @@ class DesktopActivity : Activity() {
                     }
                 }
                 setPhase("等待桌面绘制完成")
-                val ready = runPhase("等待桌面就绪", 60_000) {
-                    if (sessionMode == "chroot") {
-                        chrootRuntime.waitForDesktopReady(desktopEnv, 45_000)
-                    } else {
-                        linuxRuntime.waitForDesktopReady(desktopEnv, 45_000)
+                var ready = runPhase("等待桌面就绪", 60_000) { waitForDesktop() }
+                if (!ready && sessionMode != "chroot") {
+                    // A stale X socket, a half-dead xfce4-session or leftover locks from the
+                    // previous resolution made the first attempt die silently (seen on 1:1).
+                    // Tear the session down and retry exactly once — no polling watchdog.
+                    DesktopLog.event(
+                        this,
+                        "SESSION_RETRY",
+                        "desktop not ready, cleaning up and retrying once",
+                        activityStartedAt,
+                    )
+                    runPhase("清理失败的会话", 30_000) {
+                        linuxRuntime.stopSession()
+                        linuxRuntime.cleanupStaleSession()
                     }
+                    runPhase("重启桌面会话（第 2 次）", timeoutMs) {
+                        linuxRuntime.startSession(desktopEnv, "x11", onPhase = { phase -> setPhase(phase) })
+                    }
+                    ready = runPhase("等待桌面就绪（第 2 次）", 60_000) { waitForDesktop() }
                 }
                 if (!ready) {
                     throw IllegalStateException("桌面进程已启动，但 45 秒内没有出现（xfce4-session 可能已崩溃）")
@@ -863,6 +876,13 @@ class DesktopActivity : Activity() {
             }
         }, "LinuxDesktopSession").apply { isDaemon = true }.start()
     }
+
+    private fun waitForDesktop(): Boolean =
+        if (sessionMode == "chroot") {
+            chrootRuntime.waitForDesktopReady(desktopEnv, 45_000)
+        } else {
+            linuxRuntime.waitForDesktopReady(desktopEnv, 45_000)
+        }
 
     private class PhaseTimeout(val phase: String, val timeoutMs: Long) : RuntimeException("$phase timeout")
 
