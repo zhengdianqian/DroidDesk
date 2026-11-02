@@ -128,6 +128,7 @@ const Map<String, String> enStrings = {
   'settings.stability.log.subtitle': 'Full record of session crashes and failed installs',
   'settings.stability.log.empty': 'No log entries yet',
   'settings.stability.log.clear': 'Clear log',
+  'settings.stability.log.share': 'Export log',
   'settings.section.apps': 'Apps & package sources',
   'settings.apt.mirror.title': 'Switch mirror',
   'settings.apt.mirror.subtitle': 'Use the fastest reachable Ubuntu mirror',

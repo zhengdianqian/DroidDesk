@@ -1058,6 +1058,36 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                // ── Share the session journal so adb is never required ──
+                "shareDesktopLog" -> {
+                    val target = DesktopLog.externalFile(this) ?: DesktopLog.file(this)
+                    if (!target.exists()) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    runOnUiThread {
+                        val shared = runCatching {
+                            val uri = androidx.core.content.FileProvider.getUriForFile(
+                                this,
+                                "$packageName.updates",
+                                target,
+                            )
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, "DroidDesk desktop.log")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(send, "导出桌面日志"))
+                            true
+                        }.getOrElse { error ->
+                            Toast.makeText(this, "无法导出日志：${error.message}", Toast.LENGTH_LONG).show()
+                            false
+                        }
+                        result.success(shared)
+                    }
+                }
+
                 "getSessionState" -> result.success(
                     mapOf(
                         "expectedRunning" to DesktopSessionState.expectedRunning,

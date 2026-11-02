@@ -444,6 +444,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> shareDesktopLog() async {
+    return DroidDeskPlatform.shareDesktopLog();
+  }
+
   /// `dpkg --configure -a` + `--fix-broken` + a fresh index, shown in the normal
   /// package-progress card.
   Future<bool> repairPackageManager() async {

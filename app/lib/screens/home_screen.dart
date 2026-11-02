@@ -1283,6 +1283,12 @@ class HomeScreen extends StatelessWidget {
         actions: [
           TextButton(
             onPressed: () async {
+              await state.shareDesktopLog();
+            },
+            child: Text(AppStrings.t('settings.stability.log.share')),
+          ),
+          TextButton(
+            onPressed: () async {
               await state.clearDesktopLog();
               if (dialogContext.mounted) Navigator.pop(dialogContext);
             },

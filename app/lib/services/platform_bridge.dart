@@ -458,6 +458,11 @@ class DroidDeskPlatform {
     await _channel.invokeMethod('clearDesktopLog');
   }
 
+  /// Hands `desktop.log` to the system share sheet so it can be exported without adb.
+  static Future<bool> shareDesktopLog() async {
+    return await _channel.invokeMethod<bool>('shareDesktopLog') ?? false;
+  }
+
   static Future<Map<String, dynamic>> getSessionState() async {
     final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
       'getSessionState',

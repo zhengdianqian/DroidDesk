@@ -125,6 +125,7 @@ const Map<String, String> zhStrings = {
   'settings.stability.log.subtitle': '会话崩溃与软件包安装失败的完整记录',
   'settings.stability.log.empty': '暂无日志',
   'settings.stability.log.clear': '清空日志',
+  'settings.stability.log.share': '导出日志',
   'settings.section.apps': '应用与软件源',
   'settings.apt.mirror.title': '一键换源',
   'settings.apt.mirror.subtitle': '切换到最快的国内 Ubuntu 镜像',

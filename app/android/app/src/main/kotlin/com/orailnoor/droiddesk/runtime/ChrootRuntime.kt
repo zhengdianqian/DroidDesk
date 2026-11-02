@@ -817,7 +817,9 @@ SESSEOF
         } catch (e: Exception) {
             Log.w(TAG, "Failed to refresh chroot DNS: ${e.message}")
             DnsConfig.writeResolvConf(rootfsDir, DnsConfig.FALLBACK_DNS)
+            DesktopLog.append(context, "MOUNT", "DNS refresh failed: ${e.message}")
         }
+        DesktopLog.append(context, "MOUNT", "mounts ready (rootfs=${rootfsDir.name})")
     }
 
     private fun mountIfNeeded(relative: String, mountArgs: String, alreadyMounted: () -> Boolean) {

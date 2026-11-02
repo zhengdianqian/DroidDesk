@@ -98,6 +98,7 @@ class DesktopActivity : Activity() {
     private var desktopRevealed = false
     @Volatile private var sessionPhase = "准备中"
     @Volatile private var sessionStartInFlight = false
+    private val activityStartedAt = System.currentTimeMillis()
     @Volatile private var sessionAborted = false
     @Volatile private var x11Connected = false
     private val loadingMessageHandler = Handler(Looper.getMainLooper())
@@ -384,6 +385,12 @@ class DesktopActivity : Activity() {
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                 Log.i(TAG, "LorieView surfaceChanged ${width}x${height}")
+                DesktopLog.event(
+                    this@DesktopActivity,
+                    "DISPLAY",
+                    "surface=${width}x${height} target=${DisplayProfile.effectiveSize(this@DesktopActivity)}",
+                    activityStartedAt,
+                )
                 synchronized(this@DesktopActivity) {
                     if (!connectionRequested) {
                         connectionRequested = true
@@ -408,6 +415,7 @@ class DesktopActivity : Activity() {
                         logcatFd?.let { LorieView.startLogcat(it.detachFd()) }
                         X11ServiceClient.connectedServerPid = serverPid
                         Log.i(TAG, "LorieView connected to X11 service pid=$serverPid")
+                        DesktopLog.event(this@DesktopActivity, "X_START", "connected pid=$serverPid", activityStartedAt)
                     } else {
                         connectionFd.close()
                         logcatFd?.close()
@@ -456,12 +464,13 @@ class DesktopActivity : Activity() {
                 }.getOrNull()
                 if (value != null && value != lastImeFocus && (value == "0" || value == "1")) {
                     lastImeFocus = value
+                    DesktopLog.event(this, "IMEBRIDGE", "editable focus=$value", activityStartedAt)
                     runOnUiThread {
                         if (value == "1") showKeyboard() else hideKeyboard()
                     }
                 }
                 try {
-                    Thread.sleep(700)
+                    Thread.sleep(if (DisplayProfile.powerMode(this@DesktopActivity) == "saver") 2000L else 1200L)
                 } catch (interrupted: InterruptedException) {
                     break
                 }
@@ -795,6 +804,13 @@ class DesktopActivity : Activity() {
         val timeoutMs = 420_000L
         Thread({
             DesktopLog.append(this, TAG, "session start (mode=$sessionMode de=$desktopEnv)")
+            val size = DisplayProfile.effectiveSize(this)
+            DesktopLog.event(
+                this,
+                "SESSION_START",
+                "mode=$sessionMode de=$desktopEnv target=${size.x}x${size.y}",
+                activityStartedAt,
+            )
             try {
                 // A chroot start needs ~40-60 s on a cold image; every phase is bounded so a
                 // hang can never leave the user staring at an endless spinner.
@@ -833,6 +849,7 @@ class DesktopActivity : Activity() {
                 if (!ready) {
                     throw IllegalStateException("桌面进程已启动，但 45 秒内没有出现（xfce4-session 可能已崩溃）")
                 }
+                DesktopLog.event(this, "DE_START", "desktop processes detected", activityStartedAt)
                 revealDesktop(true)
             } catch (timeout: PhaseTimeout) {
                 abortSession("阶段「${timeout.phase}」超时（${timeout.timeoutMs / 1000} 秒）")
@@ -866,6 +883,7 @@ class DesktopActivity : Activity() {
     private fun setPhase(phase: String) {
         sessionPhase = phase
         Log.i(TAG, "Session phase: $phase")
+        DesktopLog.event(this, "PHASE", phase, activityStartedAt)
         runOnUiThread {
             if (desktopRevealed || isFinishing) return@runOnUiThread
             loadingStatus?.text = phase
@@ -875,7 +893,7 @@ class DesktopActivity : Activity() {
 
     private fun abortSession(reason: String) {
         Log.e(TAG, "Session aborted: $reason")
-        DesktopLog.append(this, TAG, "session aborted: $reason")
+        DesktopLog.event(this, "SESSION_FAIL", reason, activityStartedAt)
         runCatching {
             if (sessionMode == "chroot") chrootRuntime.stopSession() else linuxRuntime.stopSession()
         }
@@ -1119,6 +1137,14 @@ class DesktopActivity : Activity() {
             loadingFailureActions?.visibility = View.GONE
             if (!ready) Log.w(TAG, "Revealing desktop after readiness timeout")
             Log.i(TAG, "Desktop revealed ready=$ready")
+            val view = lorieView
+            DesktopLog.event(
+                this@DesktopActivity,
+                "READY",
+                "ready=$ready surface=${view?.width}x${view?.height} " +
+                    "target=${DisplayProfile.effectiveSize(this@DesktopActivity)}",
+                activityStartedAt,
+            )
             DesktopLog.append(this, TAG, "desktop revealed ready=$ready")
             enableImmersiveMode()
             loadingOverlay?.animate()

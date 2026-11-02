@@ -33,7 +33,7 @@ class ClipboardSync(
         override fun run() {
             if (!running.get()) return
             if (busy.compareAndSet(false, true)) synchronizeOnce()
-            handler.postDelayed(this, 800)
+            handler.postDelayed(this, 1600)
         }
     }
 
