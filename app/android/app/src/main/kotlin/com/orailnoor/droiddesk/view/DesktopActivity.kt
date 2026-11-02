@@ -1317,6 +1317,11 @@ private class GuestImeAnchor(
         outAttrs.imeOptions = outAttrs.imeOptions or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : InputConnectionWrapper(base, false) {
+            // Text the IME is currently composing. It is mirrored to X so pinyin
+            // preview and the committed word both reach the desktop, and the commit
+            // path subtracts what was already mirrored instead of retyping it.
+            private var composing = ""
+
             private fun commitToX(text: CharSequence?): Boolean {
                 val value = text?.toString().orEmpty()
                 if (value == "\n" || value == "\r\n") {
@@ -1333,7 +1338,20 @@ private class GuestImeAnchor(
             }
 
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                return commitToX(text)
+                val value = text?.toString().orEmpty()
+                val mirrored = composing
+                composing = ""
+                if (value == mirrored) {
+                    // Already on screen from setComposingText; nothing to do.
+                    super.commitText("", 1)
+                    return true
+                }
+                if (mirrored.isNotEmpty()) {
+                    // The IME changed the word between composing and commit; replace
+                    // the mirrored preview before sending the final text.
+                    repeat(mirrored.length.coerceAtMost(32)) { forwardKey(KeyEvent.KEYCODE_DEL) }
+                }
+                return commitToX(value)
             }
 
             // Android 13+ IMEs (including the Chinese keyboards users run here) call the
@@ -1343,14 +1361,32 @@ private class GuestImeAnchor(
                 text: CharSequence,
                 newCursorPosition: Int,
                 textAttribute: android.view.inputmethod.TextAttribute?,
-            ): Boolean = commitToX(text)
+            ): Boolean = commitText(text, newCursorPosition)
 
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                // Composing (pinyin preview) is rendered by the IME alone.
+                // Mirror the composing text so terminals and GTK entries show what the
+                // user is typing (including the pinyin preview) before it is committed.
+                val next = text?.toString().orEmpty()
+                val previous = composing
+                var common = 0
+                while (common < previous.length && common < next.length &&
+                    previous[common] == next[common]
+                ) {
+                    common++
+                }
+                repeat(previous.length - common) { forwardKey(KeyEvent.KEYCODE_DEL) }
+                val suffix = next.substring(common)
+                if (suffix.isNotEmpty()) {
+                    target()?.sendTextEvent(suffix.toByteArray(Charsets.UTF_8))
+                }
+                composing = next
                 return true
             }
 
-            override fun finishComposingText(): Boolean = true
+            override fun finishComposingText(): Boolean {
+                composing = ""
+                return true
+            }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
                 repeat(beforeLength.coerceAtMost(16)) { forwardKey(KeyEvent.KEYCODE_DEL) }
