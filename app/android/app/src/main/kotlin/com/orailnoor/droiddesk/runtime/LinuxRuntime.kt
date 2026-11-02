@@ -1175,6 +1175,14 @@ class LinuxRuntime(private val context: Context) {
         env["LC_ALL"] = "zh_CN.UTF-8"
         env["LANGUAGE"] = "zh_CN:zh"
 
+        // Desktop input: GTK/Qt must route keys through IBus so the Android IME bridge
+        // can commit composed Chinese text instead of raw scancodes.
+        val bridgeDir = File(baseDir, "guest-bridge").apply { mkdirs() }
+        env["DROIDDESK_BRIDGE"] = bridgeDir.absolutePath
+        env["GTK_IM_MODULE"] = "ibus"
+        env["QT_IM_MODULE"] = "ibus"
+        env["XMODIFIERS"] = "@im=ibus"
+
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = tmpDir.absolutePath
 
@@ -1234,20 +1242,29 @@ class LinuxRuntime(private val context: Context) {
         onProgress: ((Double, String) -> Unit)? = null,
         progress: Double = 0.72,
     ): Boolean {
-        if (!isDpkgPackageInstalled("mesa")) {
+        val startedAt = System.currentTimeMillis()
+        fun mark(step: String) = DesktopLog.event(context, "GRAPHICS", step, startedAt)
+        mark("check begin")
+        val mesaInstalled = isDpkgPackageInstalled("mesa")
+        mark("mesa installed=$mesaInstalled")
+        if (!mesaInstalled) {
             onProgress?.invoke(progress, "Installing Mesa graphics runtime...")
             // libc++ too: apt keeps an older installed copy, which Mesa can't load against.
             if (!installPackageGroup("pkg install -y mesa libc++")) {
                 Log.e(TAG, "Mesa graphics runtime installation failed")
                 return false
             }
+            mark("mesa installed")
         }
-        if (mesaNeedsNewerLibcxx()) {
+        val needsLibcxx = mesaNeedsNewerLibcxx()
+        mark("libcxx probe needs-upgrade=$needsLibcxx")
+        if (needsLibcxx) {
             onProgress?.invoke(progress, "Updating the C++ runtime for graphics...")
             Log.w(TAG, "Mesa needs a newer libc++ than installed; upgrading it")
             if (!installPackageGroup("pkg install -y libc++") || mesaNeedsNewerLibcxx()) {
                 Log.e(TAG, "libc++ is still too old for Mesa; OpenGL will be unavailable")
             }
+            mark("libcxx done")
         }
 
         if (hasAdrenoGpu()) {
@@ -1282,10 +1299,22 @@ class LinuxRuntime(private val context: Context) {
             ?.toList().orEmpty()) + listOf(File(lib, "libvulkan_freedreno.so")).filter { it.isFile }
         if (mesaLibs.isEmpty()) return false
         val symbol = "_ZNSt6__ndk113__hash_memoryEPKvm"
+        // Scanning tens of megabytes of Mesa binaries on every launch is pure boot
+        // latency. Cache a positive ("libc++ is new enough") result keyed to the files.
+        val signature = mesaLibs.joinToString(":") { "${it.name}=${it.lastModified()}" } +
+            "|libcxx=${libcxx.lastModified()}"
+        val marker = File(baseDir, ".mesa_libcxx_ok")
+        if (marker.isFile && marker.readText().trim() == signature) return false
         val quoted = mesaLibs.joinToString(" ") { "'${it.absolutePath}'" }
         val needed = runQuickCommand("grep -lqa '$symbol' $quoted && echo yes").contains("yes")
-        if (!needed) return false
-        return !runQuickCommand("grep -qa '$symbol' '${libcxx.absolutePath}' && echo yes").contains("yes")
+        if (!needed) {
+            runCatching { marker.writeText(signature) }
+            return false
+        }
+        val libcxxOk = runQuickCommand("grep -qa '$symbol' '${libcxx.absolutePath}' && echo yes").contains("yes")
+        if (!libcxxOk) return true
+        runCatching { marker.writeText(signature) }
+        return false
     }
 
     // ── Native Package Installation ──
@@ -1451,7 +1480,13 @@ class LinuxRuntime(private val context: Context) {
         val result = executeCommand(
             "dpkg-query -W -f='${'$'}{Status}' $packageName",
         )
-        return !result.startsWith("Error:") && result.trim() == "install ok installed"
+        if (result.isNotBlank() && !result.startsWith("Error:")) {
+            return result.trim() == "install ok installed"
+        }
+        // A blank answer means the query was routed into a leftover interactive shell.
+        // Falling back to dpkg's file list keeps a restart from reinstalling Mesa again.
+        return File(prefixDir, "var/lib/dpkg/info/$packageName.list").isFile ||
+            File(prefixDir, "var/lib/dpkg/info/$packageName:arm64.list").isFile
     }
 
     /**
@@ -2216,6 +2251,27 @@ class LinuxRuntime(private val context: Context) {
             fi
             echo "DIAG: PulseAudio sinks: ${'$'}(limit 2 pactl list short sinks 2>/dev/null | cut -f2 | tr '\n' ' ')"
 
+            # IBus must exist before GTK/Qt create input contexts; XFCE autostart is
+            # unreliable on relocated prefixes, so start it explicitly.
+            if command -v ibus-daemon >/dev/null 2>&1; then
+                pkill -9 -x ibus-daemon >/dev/null 2>&1 || true
+                limit 10 ibus-daemon -drx >/dev/null 2>&1 || true
+            fi
+
+            # Android IME bridge: 1 only while an editable widget holds IBus focus.
+            BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
+            mkdir -p "${'$'}BRIDGE" 2>/dev/null || true
+            printf '0\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null || true
+            if command -v dbus-monitor >/dev/null 2>&1; then
+                ( dbus-monitor --session "interface='org.freedesktop.IBus.Panel'" 2>/dev/null |
+                  while read -r line; do
+                    case "${'$'}line" in
+                      *"member=FocusIn"*)  printf '1\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null ;;
+                      *"member=FocusOut"*) printf '0\n' > "${'$'}BRIDGE/ime-focus" 2>/dev/null ;;
+                    esac
+                  done ) &
+            fi
+
             echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."
             exec $desktopCommand
         """.trimIndent()
@@ -2308,6 +2364,34 @@ class LinuxRuntime(private val context: Context) {
     }
 
     // ── Command Execution ──
+
+    /**
+     * Prints the actual package-manager state of the Termux prefix so a failed
+     * install can be explained instead of silently rolling back to "失败".
+     */
+    fun diagnosePackageManager(onLog: (String) -> Unit = {}) {
+        val command = """
+            echo "[arch] ${'$'}(dpkg --print-architecture 2>&1)"
+            echo "[prefix] ${'$'}{PREFIX:-unknown}"
+            echo "[sources]"
+            grep -vE '^#|^${'$'}' ${'$'}{PREFIX}/etc/apt/sources.list 2>/dev/null || echo "sources.list missing"
+            ls ${'$'}{PREFIX}/etc/apt/sources.list.d 2>/dev/null || true
+            echo "[network]"
+            getprop net.dns1 2>/dev/null || true
+            echo "[locks]"
+            ls -l ${'$'}{PREFIX}/var/lib/dpkg/lock ${'$'}{PREFIX}/var/lib/dpkg/lock-frontend 2>/dev/null || true
+            echo "[dpkg-configure]"
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/tmp/droiddesk-dpkg.log 2>&1
+            echo "exit=${'$'}?"
+            tail -n 20 /tmp/droiddesk-dpkg.log
+            echo "[apt-update]"
+            apt-get update -o Acquire::Retries=1 >/tmp/droiddesk-apt-update.log 2>&1
+            echo "exit=${'$'}?"
+            tail -n 20 /tmp/droiddesk-apt-update.log
+        """.trimIndent()
+        DesktopLog.append(context, TAG, "diagnose package manager (termux)")
+        executeCommand(command) { chunk -> onLog(chunk) }
+    }
 
     fun executeCommand(command: String, onOutput: ((String) -> Unit)? = null): String {
         if (packageOperationCancelled) return "Error: Package operation cancelled"

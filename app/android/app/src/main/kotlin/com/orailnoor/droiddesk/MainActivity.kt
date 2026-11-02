@@ -1142,7 +1142,7 @@ class MainActivity : FlutterActivity() {
                         if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
                             chrootRuntime.diagnosePackageManager(log)
                         } else {
-                            log("当前为 Termux 运行模式（无 root），不需要 Ubuntu 源诊断\n")
+                            linuxRuntime.diagnosePackageManager(log)
                         }
                         runOnUiThread { result.success(true) }
                     }

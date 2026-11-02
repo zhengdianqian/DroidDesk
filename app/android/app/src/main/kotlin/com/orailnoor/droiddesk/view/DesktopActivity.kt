@@ -454,7 +454,7 @@ class DesktopActivity : Activity() {
      * from a plain window click. Opt-out via Settings → 自动弹出输入法.
      */
     private fun startAutoImePolling() {
-        if (sessionMode != "chroot" || !DisplayProfile.autoIme(this) || imePollThread != null) return
+        if (!DisplayProfile.autoIme(this) || imePollThread != null) return
         imePolling = true
         imePollThread = Thread({
             val focusFile = File(filesDir, "guest-bridge/ime-focus")
