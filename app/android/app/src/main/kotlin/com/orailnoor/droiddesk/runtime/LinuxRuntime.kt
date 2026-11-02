@@ -1305,8 +1305,12 @@ class LinuxRuntime(private val context: Context) {
                 syms[1] = ks;
                 XChangeKeyboardMapping(dpy, spare_kc, 2, syms, 1);
                 XSync(dpy, False);
-                usleep(20000);
+                /* Clients (GTK/VTE) only see the new keysym after they process
+                   MappingNotify. Give them a full frame before pressing, otherwise
+                   the previous character repeats on screen. */
+                usleep(120000);
                 tap(spare_kc, 0);
+                usleep(30000);
             }
 
             static void send_codepoint(unsigned cp) {
