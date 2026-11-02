@@ -1140,6 +1140,100 @@ class LinuxRuntime(private val context: Context) {
 
     private fun File.readTextOrNull(): String? = runCatching { readText() }.getOrNull()
 
+    /**
+     * Builds a tiny X11 helper that prints the WM_CLASS of the focused window.
+     *
+     * AT-SPI is not usable in this bootstrap: PyGObject is missing and at-spi's launcher
+     * is hard-wired to Termux's dbus path, so no GTK app ever registers on the bus. The
+     * IME bridge therefore falls back to reading X focus (same heuristic the desktop
+     * input code has always used) and only pops the keyboard for editable app classes.
+     */
+    private fun ensureFocusProbe(): File? {
+        val bin = File(binDir, "droiddesk-x11-focus")
+        val src = File(tmpDir, "x11_focus.c")
+        val marker = File(binDir, ".x11_focus_build")
+        val source = """
+            #include <X11/Xlib.h>
+            #include <X11/Xutil.h>
+            #include <stdio.h>
+            #include <string.h>
+
+            int main(void) {
+                Display *d = XOpenDisplay(NULL);
+                if (!d) { printf("-\n"); return 0; }
+                Window w; int revert = 0;
+                XGetInputFocus(d, &w, &revert);
+                int depth = 0;
+                while (w != None && w != PointerRoot && depth < 16) {
+                    XClassHint hint;
+                    memset(&hint, 0, sizeof(hint));
+                    if (XGetClassHint(d, w, &hint)) {
+                        printf("%s.%s\n",
+                               hint.res_name ? hint.res_name : "",
+                               hint.res_class ? hint.res_class : "");
+                        if (hint.res_name) XFree(hint.res_name);
+                        if (hint.res_class) XFree(hint.res_class);
+                        XCloseDisplay(d);
+                        return 0;
+                    }
+                    Window root = 0, parent = 0, *children = NULL;
+                    unsigned int n = 0;
+                    if (!XQueryTree(d, w, &root, &parent, &children, &n)) break;
+                    if (children) XFree(children);
+                    if (parent == 0 || parent == w) break;
+                    w = parent;
+                    depth++;
+                }
+                printf("-\n");
+                XCloseDisplay(d);
+                return 0;
+            }
+        """.trimIndent() + "\n"
+
+        if (bin.isFile && marker.isFile &&
+            marker.readTextOrNull().orEmpty() == source.hashCode().toString()
+        ) {
+            return bin
+        }
+        src.writeText(source)
+        val compiler = File(binDir, "clang")
+        if (!compiler.exists()) {
+            DesktopLog.append(context, TAG, "focus probe skipped: clang missing")
+            return null
+        }
+        return runCatching {
+            val process = ProcessBuilder(
+                compiler.absolutePath,
+                src.absolutePath,
+                "-O2",
+                "-o", bin.absolutePath,
+                "-I", File(prefixDir, "include").absolutePath,
+                "-L", File(prefixDir, "lib").absolutePath,
+                "-lX11",
+            )
+                .redirectErrorStream(true)
+                .also { pb ->
+                    pb.environment().clear()
+                    pb.environment()["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
+                    pb.environment()["TMPDIR"] = tmpDir.absolutePath
+                }
+                .start()
+            val log = process.inputStream.bufferedReader().readText()
+            val code = process.waitFor()
+            if (code == 0) {
+                marker.writeText(source.hashCode().toString())
+                DesktopLog.append(context, TAG, "focus probe compiled")
+                bin
+            } else {
+                DesktopLog.append(context, TAG, "focus probe build failed ($code): $log")
+                null
+            }
+        }.getOrElse {
+            DesktopLog.append(context, TAG, "focus probe build error: ${it.message}")
+            null
+        }
+    }
+
     // ── Environment Configuration ──
 
     private fun getTermuxEnv(): Map<String, String> {
@@ -2163,6 +2257,11 @@ class LinuxRuntime(private val context: Context) {
         File(tmpDir, ".X11-unix").mkdirs()
 
         mark("dbus:begin")
+        // AT-SPI cannot register in this bootstrap; the X-focus helper is what the IME
+        // watcher actually uses. Build it before the session so the first launch pays
+        // the compile cost only once.
+        val focusProbe = ensureFocusProbe()
+        mark("focus-probe")
         onPhase("启动会话总线")
 
         // Remove stale Xfce ICE listeners left by a killed/restarted activity.
@@ -2446,11 +2545,40 @@ while IFS='|' read -r sender path detail; do
     esac
 done
 DROIDDESK_SH
-            if command -v dbus-monitor >/dev/null 2>&1 && command -v dbus-send >/dev/null 2>&1; then
+            FOCUS_PROBE="${focusProbe?.absolutePath ?: ""}"
+            # X focus fallback: WM_CLASS whitelist. AT-SPI never receives events in this
+            # bootstrap (no PyGObject, launcher bound to Termux's dbus), so the focus
+            # probe built above is the working path. Only whitelisted editable app
+            # classes pop the keyboard; tapping the desktop or a panel writes 0.
+            cat > "${'$'}BRIDGE/ime-watch-x11.sh" <<'DROIDDESK_X11'
+#!/system/bin/sh
+BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
+FOCUS="${'$'}BRIDGE/ime-focus"
+LAST="none"
+while true; do
+    cls="${'$'}("${'$'}{DROIDDESK_X11_FOCUS:-}" 2>/dev/null)"
+    case "${'$'}cls" in
+        *xfce4-terminal*|*zenity*|*Zenity*|*thunar*|*Thunar*|*mousepad*|*Mousepad*|\
+*xfce4-settings*|*Xfce4-settings*|*gedit*|*XTerm*|*xterm*|*urxvt*|*leafpad*|\
+*droiddesk*|*code-oss*|*Code*|*firefox*|*Chromium*|*libreoffice*)
+            state=1 ;;
+        *) state=0 ;;
+    esac
+    if [ "${'$'}LAST" != "${'$'}state" ]; then
+        LAST="${'$'}state"
+        printf '%s\n' "${'$'}state" > "${'$'}FOCUS" 2>/dev/null || true
+    fi
+    sleep 0.3
+done
+DROIDDESK_X11
+            if [ -n "${'$'}FOCUS_PROBE" ] && [ -x "${'$'}FOCUS_PROBE" ]; then
+                ( DROIDDESK_X11_FOCUS="${'$'}FOCUS_PROBE" sh "${'$'}BRIDGE/ime-watch-x11.sh" >/dev/null 2>&1 ) &
+                echo "DIAG: x11 focus ime watcher started"
+            elif command -v dbus-monitor >/dev/null 2>&1 && command -v dbus-send >/dev/null 2>&1; then
                 ( sh "${'$'}BRIDGE/ime-watch.sh" >/dev/null 2>&1 ) &
-                echo "DIAG: at-spi ime watcher started"
+                echo "DIAG: at-spi ime watcher started (x11 probe unavailable)"
             else
-                echo "DIAG: dbus tools missing, ime watcher disabled"
+                echo "DIAG: no ime watcher available"
             fi
 
             echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."
