@@ -3,13 +3,11 @@ package com.orailnoor.droiddesk.runtime
 /**
  * Cross-component view of the desktop session that *should* be running.
  *
- * DesktopActivity knows when a session was started; DroidDeskService is the component that
- * survives when the activity is gone. The service watchdog uses this flag to distinguish
- * "the user pressed Stop" from "the proot/chroot child was killed in the background".
+ * This is bookkeeping only: who started which desktop environment, and when. There is no
+ * watchdog and no automatic restart — the crash/session log ([DesktopLog]) is the way to
+ * diagnose a session that died, and the user decides when to start it again.
  */
 object DesktopSessionState {
-    const val MAX_RESTARTS = 3
-
     @Volatile var expectedRunning: Boolean = false
         private set
 
@@ -17,9 +15,6 @@ object DesktopSessionState {
         private set
 
     @Volatile var desktopEnv: String = "xfce4"
-        private set
-
-    @Volatile var restartCount: Int = 0
         private set
 
     @Volatile var lastStartAt: Long = 0L
@@ -35,18 +30,10 @@ object DesktopSessionState {
         lastStartAt = System.currentTimeMillis()
     }
 
-    fun markRestarted() {
-        restartCount += 1
-        lastStartAt = System.currentTimeMillis()
-    }
-
     fun markStopped() {
         expectedRunning = false
         lastStopAt = System.currentTimeMillis()
-        restartCount = 0
     }
-
-    fun canRestart(): Boolean = restartCount < MAX_RESTARTS
 }
 
 /**
@@ -68,7 +55,7 @@ object PhantomGuard {
         val rooted = runCatching { ChrootRuntime(context).hasRoot() }.getOrDefault(false)
         val monitor = readGlobalSetting(context, rooted)
         val maxProcesses = readMaxPhantomProcesses(context, rooted)
-        val numericMax = maxProcesses.toIntOrNull()
+        val numericMax = maxProcesses?.toIntOrNull()
         val monitorEnabled = when (monitor) {
             "0", "false" -> false
             "1", "true" -> true
@@ -108,7 +95,7 @@ object PhantomGuard {
                 "ok" to ok,
                 "message" to output.trim(),
                 "monitorSetting" to (readGlobalSetting(context, true) ?: "unknown"),
-                "maxPhantomProcesses" to (readMaxPhantomProcesses(true) ?: "unknown"),
+                "maxPhantomProcesses" to (readMaxPhantomProcesses(context, true) ?: "unknown"),
             )
         } catch (error: Throwable) {
             mapOf("ok" to false, "message" to (error.message ?: "Failed to change phantom-process limits"))

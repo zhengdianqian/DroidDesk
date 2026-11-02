@@ -11,18 +11,21 @@ import kotlin.math.roundToInt
 /**
  * Single source of truth for the X11 framebuffer size and the UI scale.
  *
- * The old code forced `displayScale = 150` in "scaled" mode: the X server got
- * framebuffer = Surface / 1.5 and the compositor stretched it back to the Surface, so every
- * pixel was resampled (that is the blur the user saw) and `startLinux` additionally clamped
- * the height to 1080. Here the default is `native`, i.e. the framebuffer is exactly the
- * Surface in physical pixels, and readability is achieved inside the desktop with an
- * integer UI scale (Xft DPI) instead of a final stretch.
+ * Resolution is user selectable and defaults to a *scaled* (power saving) profile: the X
+ * framebuffer is `physical * frameScale` (0.75x by default) and the compositor enlarges it
+ * with nearest-neighbour filtering, so nothing is bilinearly blurred. "1:1 物理像素" maps the
+ * framebuffer to the panel one-to-one instead.
  */
 object DisplayProfile {
     private const val PREFS = "FlutterSharedPreferences"
-    const val MODE_NATIVE = "native"
+    const val MODE_DEVICE = "device"          // follow device, scaled by frameScale
+    const val MODE_ONE_TO_ONE = "oneToOne"    // framebuffer == physical pixels
     const val MODE_1080P = "1080p"
     const val MODE_1440P = "1440p"
+
+    const val DEFAULT_FRAME_SCALE = 0.75
+    val FRAME_SCALES = listOf(0.5, 0.75, 1.0)
+
     const val DEFAULT_SCALE = 1.5
     val SCALES = listOf(1.0, 1.25, 1.5, 2.0)
 
@@ -30,8 +33,19 @@ object DisplayProfile {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun mode(context: Context): String {
-        val value = prefs(context).getString("flutter.ddResolutionMode", MODE_NATIVE) ?: MODE_NATIVE
-        return if (value in listOf(MODE_NATIVE, MODE_1080P, MODE_1440P)) value else MODE_NATIVE
+        val value = prefs(context).getString("flutter.ddResolutionMode", MODE_DEVICE) ?: MODE_DEVICE
+        return if (value in listOf(MODE_DEVICE, MODE_ONE_TO_ONE, MODE_1080P, MODE_1440P)) {
+            value
+        } else {
+            MODE_DEVICE
+        }
+    }
+
+    fun frameScale(context: Context): Double {
+        val raw = prefs(context).getString("flutter.ddFrameScale", null)
+        val parsed = raw?.toDoubleOrNull() ?: DEFAULT_FRAME_SCALE
+        return parsed.takeIf { value -> FRAME_SCALES.any { kotlin.math.abs(it - value) < 0.001 } }
+            ?: DEFAULT_FRAME_SCALE
     }
 
     fun uiScale(context: Context): Double {
@@ -64,7 +78,7 @@ object DisplayProfile {
         return Point(metrics.widthPixels, metrics.heightPixels)
     }
 
-    /** Framebuffer size the X server should allocate for the selected resolution preset. */
+    /** Framebuffer size the X server should allocate for the selected resolution profile. */
     fun effectiveSize(context: Context): Point {
         val physical = physicalSize(context)
         val portrait = physical.y >= physical.x
@@ -73,10 +87,16 @@ object DisplayProfile {
         return when (mode(context)) {
             MODE_1080P -> if (portrait) Point(1080, 1920) else Point(1920, 1080)
             MODE_1440P -> if (portrait) Point(1440, 2560) else Point(2560, 1440)
-            else -> if (physical.x > 0 && physical.y > 0) {
+            MODE_ONE_TO_ONE -> if (physical.x > 0 && physical.y > 0) {
                 Point(physical.x, physical.y)
             } else {
                 if (portrait) Point(short, long) else Point(long, short)
+            }
+            else -> {
+                val scale = frameScale(context)
+                val w = (physical.x * scale).roundToInt().let { if (it % 2 == 0) it else it + 1 }
+                val h = (physical.y * scale).roundToInt().let { if (it % 2 == 0) it else it + 1 }
+                if (w > 0 && h > 0) Point(w, h) else Point(short, long)
             }
         }
     }
@@ -86,25 +106,21 @@ object DisplayProfile {
      * measured, because the X server is created from those values.
      */
     fun applyToX11(context: Context) {
-        val selected = mode(context)
         val target = effectiveSize(context)
+        val physical = physicalSize(context)
+        val exact = target.x == physical.x && target.y == physical.y
         TermuxMainActivity.getPrefs().apply {
             displayScale.put(100)
             displayFilteringMode.put("nearest")
             adjustResolution.put(false)
-            when (selected) {
-                MODE_NATIVE -> {
-                    displayResolutionMode.put("native")
-                    // The view is already physical-pixel sized; stretching is a no-op here
-                    // and keeps the desktop full-bleed.
-                    displayStretch.put(true)
-                }
-                else -> {
-                    displayResolutionMode.put("custom")
-                    displayResolutionCustom.put("${target.x}x${target.y}")
-                    // Letterbox instead of rescale: the framebuffer maps 1:1 to screen pixels.
-                    displayStretch.put(false)
-                }
+            if (exact) {
+                displayResolutionMode.put("native")
+                displayStretch.put(true)
+            } else {
+                // Custom framebuffer, nearest-neighbour upscale to the Surface (no bilinear blur).
+                displayResolutionMode.put("custom")
+                displayResolutionCustom.put("${target.x}x${target.y}")
+                displayStretch.put(true)
             }
         }
     }
@@ -113,20 +129,23 @@ object DisplayProfile {
         val physical = physicalSize(context)
         val target = effectiveSize(context)
         val scale = uiScale(context)
+        val frame = frameScale(context)
         val density = context.resources.displayMetrics.densityDpi
+        val exact = physical.x == target.x && physical.y == target.y
         return mapOf(
             "deviceWidth" to physical.x,
             "deviceHeight" to physical.y,
             "width" to target.x,
             "height" to target.y,
             "resolutionMode" to mode(context),
-            "x11Mode" to if (mode(context) == MODE_NATIVE) "native" else "custom",
+            "frameScale" to frame,
+            "x11Mode" to if (exact) "native" else "custom",
             "uiScale" to scale,
             "xftDpi" to xftDpi(scale),
             "densityDpi" to density,
             "powerMode" to powerMode(context),
             "autoIme" to autoIme(context),
-            "oneToOne" to (physical.x == target.x && physical.y == target.y),
+            "oneToOne" to exact,
         )
     }
 }

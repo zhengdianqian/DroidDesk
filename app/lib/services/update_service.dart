@@ -26,7 +26,7 @@ class AppRelease {
 
 /// Checks GitHub Releases for a newer DroidDesk build.
 class UpdateService {
-  static const repo = 'orailnoor/DroidDesk';
+  static const repo = 'zhengdianqian/DroidDesk';
   // Test builds can point at a local mock: --dart-define=DROIDDESK_UPDATE_URL=http://...
   static const _latestUrl = String.fromEnvironment(
     'DROIDDESK_UPDATE_URL',
@@ -54,6 +54,13 @@ class UpdateService {
     final Map<String, dynamic> json;
     try {
       json = await _fetchLatest();
+    } on HttpException catch (error) {
+      // Rate limiting must never nag the user with popups, manual or not.
+      if (error.message.contains('403') || error.message.contains('429')) {
+        return null;
+      }
+      if (manual) rethrow;
+      return null;
     } catch (error) {
       if (manual) rethrow;
       return null;
@@ -65,11 +72,8 @@ class UpdateService {
     if (!isNewer(tag, installedVersion)) return null;
     if (!manual && prefs.getString(_skippedTagKey) == tag) return null;
 
-    final assets = (json['assets'] as List? ?? const []).cast<Map>();
-    final apk = assets.where(
-      (asset) => asset['name'].toString().toLowerCase().endsWith('.apk'),
-    );
-    if (apk.isEmpty) return null;
+    final apk = _pickApk((json['assets'] as List? ?? const []).cast<Map>());
+    if (apk == null) return null;
 
     return AppRelease(
       tag: tag,
@@ -77,9 +81,22 @@ class UpdateService {
       title: json['name']?.toString() ?? tag,
       notes: (json['body']?.toString() ?? '').trim(),
       pageUrl: json['html_url']?.toString() ?? 'https://github.com/$repo/releases',
-      apkUrl: apk.first['browser_download_url'].toString(),
-      apkSize: (apk.first['size'] as num?)?.toInt() ?? 0,
+      apkUrl: apk['browser_download_url'].toString(),
+      apkSize: (apk['size'] as num?)?.toInt() ?? 0,
     );
+  }
+
+  /// Prefers the arm64 asset (`DroidDesk-v1.4.0-arm64.apk`), falls back to any APK.
+  static Map? _pickApk(List<Map> assets) {
+    final apks = assets
+        .where((asset) => asset['name'].toString().toLowerCase().endsWith('.apk'))
+        .toList();
+    if (apks.isEmpty) return null;
+    for (final asset in apks) {
+      final name = asset['name'].toString().toLowerCase();
+      if (name.contains('arm64') || name.contains('aarch64')) return asset;
+    }
+    return apks.first;
   }
 
   static Future<void> skip(String tag) async {

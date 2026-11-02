@@ -62,7 +62,8 @@ class AppState extends ChangeNotifier {
   bool get autoStartDesktop => _autoStartDesktop;
 
   // ── Desktop display & reliability ──
-  String _resolutionMode = 'native';
+  String _resolutionMode = 'device';
+  double _frameScale = 0.75;
   double _uiScale = 1.5;
   String _powerMode = 'standard';
   bool _autoIme = true;
@@ -71,6 +72,7 @@ class AppState extends ChangeNotifier {
   Map<String, dynamic> _phantomStatus = {};
 
   String get resolutionMode => _resolutionMode;
+  double get frameScale => _frameScale;
   double get uiScale => _uiScale;
   String get powerMode => _powerMode;
   bool get autoIme => _autoIme;
@@ -225,7 +227,8 @@ class AppState extends ChangeNotifier {
 
     final prefs = await SharedPreferences.getInstance();
     _autoStartDesktop = prefs.getBool('autoStartDesktop') ?? false;
-    _resolutionMode = prefs.getString('ddResolutionMode') ?? 'native';
+    _resolutionMode = prefs.getString('ddResolutionMode') ?? 'device';
+    _frameScale = double.tryParse(prefs.getString('ddFrameScale') ?? '') ?? 0.75;
     _uiScale = double.tryParse(prefs.getString('ddUiScale') ?? '') ?? 1.5;
     _powerMode = prefs.getString('ddPowerMode') ?? 'standard';
     _autoIme = prefs.getBool('ddAutoIme') ?? true;
@@ -357,6 +360,7 @@ class AppState extends ChangeNotifier {
   /// Persists one display preference; the next desktop start applies it.
   Future<void> setDisplayProfile({
     String? resolutionMode,
+    double? frameScale,
     double? uiScale,
     String? powerMode,
     bool? autoIme,
@@ -365,6 +369,10 @@ class AppState extends ChangeNotifier {
     if (resolutionMode != null) {
       _resolutionMode = resolutionMode;
       await prefs.setString('ddResolutionMode', resolutionMode);
+    }
+    if (frameScale != null) {
+      _frameScale = frameScale;
+      await prefs.setString('ddFrameScale', frameScale.toStringAsFixed(2));
     }
     if (uiScale != null) {
       _uiScale = uiScale;

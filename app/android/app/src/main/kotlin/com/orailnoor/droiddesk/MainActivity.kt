@@ -1036,7 +1036,6 @@ class MainActivity : FlutterActivity() {
                 "getSessionState" -> result.success(
                     mapOf(
                         "expectedRunning" to DesktopSessionState.expectedRunning,
-                        "restartCount" to DesktopSessionState.restartCount,
                         "mode" to DesktopSessionState.mode,
                     ),
                 )

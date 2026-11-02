@@ -40,7 +40,6 @@ import com.orailnoor.droiddesk.runtime.ClipboardSync
 import com.orailnoor.droiddesk.runtime.XfceMobileProfile
 import com.orailnoor.droiddesk.runtime.DisplayProfile
 import com.orailnoor.droiddesk.runtime.DesktopLog
-import com.orailnoor.droiddesk.runtime.DesktopSessionState
 import com.orailnoor.droiddesk.runtime.PhantomGuard
 import com.orailnoor.droiddesk.x11.X11ServiceClient
 import com.orailnoor.droiddesk.x11.X11InputController
@@ -76,8 +75,6 @@ class DesktopActivity : Activity() {
     private var imePollThread: Thread? = null
     @Volatile private var imePolling = false
     private var lastImeFocus: String? = null
-    private var desktopWatchdog: Handler? = null
-    private var crashRestartInFlight = false
     private var loadingOverlay: FrameLayout? = null
     private var loadingStatus: TextView? = null
     private var loadingEstimate: TextView? = null
@@ -128,7 +125,6 @@ class DesktopActivity : Activity() {
         private const val TAG = "DesktopActivity"
         private const val COLLAPSED_IDLE_ALPHA = 0.4f
         private const val COLLAPSED_FADE_DELAY_MS = 3_000L
-        private const val WATCHDOG_INTERVAL_MS = 5_000L
         private var current: java.lang.ref.WeakReference<DesktopActivity>? = null
 
         fun isOpen(): Boolean = current?.get()?.isFinishing == false
@@ -369,49 +365,6 @@ class DesktopActivity : Activity() {
             }
         }, "DroidDeskAutoIme").apply { isDaemon = true }
         imePollThread?.start()
-    }
-
-    /**
-     * Keeps watching the session process: the X server can outlive the desktop shell, leaving
-     * a frozen frame. Restarts it up to [DesktopSessionState.MAX_RESTARTS] times and records
-     * every incident in the on-device desktop log.
-     */
-    private fun startSessionWatchdog() {
-        if (desktopWatchdog != null) return
-        val handler = Handler(Looper.getMainLooper())
-        desktopWatchdog = handler
-        val check = object : Runnable {
-            override fun run() {
-                if (!desktopRevealed || isFinishing || isDestroyed) {
-                    handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
-                    return
-                }
-                if (!isSessionRunning() && !crashRestartInFlight) {
-                    DesktopLog.append(this@DesktopActivity, TAG, "desktop session exited unexpectedly")
-                    if (DesktopSessionState.canRestart()) {
-                        crashRestartInFlight = true
-                        DesktopSessionState.markRestarted()
-                        Toast.makeText(
-                            this@DesktopActivity,
-                            "桌面会话已退出，正在自动恢复（第 ${DesktopSessionState.restartCount} 次）",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                        handler.postDelayed({
-                            crashRestartInFlight = false
-                            if (!isSessionRunning()) restartSessionIfStopped()
-                        }, 2_000)
-                    } else {
-                        Toast.makeText(
-                            this@DesktopActivity,
-                            "桌面多次退出，已停止自动恢复。请在应用设置中查看桌面日志。",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-                handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
-            }
-        }
-        handler.postDelayed(check, WATCHDOG_INTERVAL_MS)
     }
 
     private fun addDesktopControls() {
@@ -864,7 +817,6 @@ class DesktopActivity : Activity() {
                     collapsedControl?.visibility = View.VISIBLE
                     collapsedControl?.bringToFront()
                     lorieView?.requestFocus()
-                    startSessionWatchdog()
                 }
                 ?.start()
         }
@@ -920,8 +872,6 @@ class DesktopActivity : Activity() {
         imePolling = false
         imePollThread?.interrupt()
         imePollThread = null
-        desktopWatchdog?.removeCallbacksAndMessages(null)
-        desktopWatchdog = null
         clipboardSync?.stop()
         clipboardSync = null
         extraKeysBar?.releaseAll()

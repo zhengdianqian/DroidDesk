@@ -663,9 +663,27 @@ class HomeScreen extends StatelessWidget {
                             ),
                             options: [
                               (
-                                'native',
+                                'device:0.50',
                                 AppStrings.t(
-                                  'settings.display.resolution.native',
+                                  'settings.display.resolution.device050',
+                                ),
+                              ),
+                              (
+                                'device:0.75',
+                                AppStrings.t(
+                                  'settings.display.resolution.device075',
+                                ),
+                              ),
+                              (
+                                'device:1.00',
+                                AppStrings.t(
+                                  'settings.display.resolution.device100',
+                                ),
+                              ),
+                              (
+                                'oneToOne',
+                                AppStrings.t(
+                                  'settings.display.resolution.oneToOne',
                                 ),
                               ),
                               (
@@ -677,9 +695,28 @@ class HomeScreen extends StatelessWidget {
                                 AppStrings.t('settings.display.resolution.1440p'),
                               ),
                             ],
-                            selected: state.resolutionMode,
-                            onSelected: (value) =>
-                                state.setDisplayProfile(resolutionMode: value),
+                            selected: _resolutionOption(state),
+                            onSelected: (value) {
+                              if (value.startsWith('device:')) {
+                                state.setDisplayProfile(
+                                  resolutionMode: 'device',
+                                  frameScale: double.tryParse(
+                                    value.substring('device:'.length),
+                                  ),
+                                );
+                              } else {
+                                state.setDisplayProfile(resolutionMode: value);
+                              }
+                              ScaffoldMessenger.of(pageContext).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    AppStrings.t(
+                                      'settings.display.resolution.restart',
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
                           );
                         },
                       ),
@@ -985,11 +1022,33 @@ class HomeScreen extends StatelessWidget {
 
   // ── Display / stability helpers ──
 
+  /// Choice key of the currently active resolution profile (see `_showChoiceSheet`).
+  String _resolutionOption(AppState state) {
+    switch (state.resolutionMode) {
+      case '1080p':
+        return '1080p';
+      case '1440p':
+        return '1440p';
+      case 'oneToOne':
+        return 'oneToOne';
+      default:
+        final scale = state.frameScale;
+        final key = scale <= 0.62
+            ? '0.50'
+            : (scale <= 0.87 ? '0.75' : '1.00');
+        return 'device:$key';
+    }
+  }
+
   String _resolutionSubtitle(AppState state) {
     final label = switch (state.resolutionMode) {
       '1080p' => AppStrings.t('settings.display.resolution.1080p'),
       '1440p' => AppStrings.t('settings.display.resolution.1440p'),
-      _ => AppStrings.t('settings.display.resolution.native'),
+      'oneToOne' => AppStrings.t('settings.display.resolution.oneToOne'),
+      _ => AppStrings.t(
+        'settings.display.resolution.device',
+        args: {'scale': '${state.frameScale}x'},
+      ),
     };
     final width = state.displayInfo['width'];
     final height = state.displayInfo['height'];
@@ -998,7 +1057,13 @@ class HomeScreen extends StatelessWidget {
       'settings.display.resolution.current',
       args: {'width': '$width', 'height': '$height'},
     );
-    return '$label · $active';
+    final exact = state.displayInfo['oneToOne'] == true;
+    final ratio = AppStrings.t(
+      exact
+          ? 'settings.display.resolution.ratioExact'
+          : 'settings.display.resolution.ratioScaled',
+    );
+    return '$label · $active · $ratio';
   }
 
   String _phantomSubtitle(AppState state) {
