@@ -78,6 +78,22 @@ object DisplayProfile {
         return Point(metrics.widthPixels, metrics.heightPixels)
     }
 
+    /**
+     * Scales the panel down to the requested short side while keeping its aspect ratio, and
+     * never exceeds the panel on the other axis.
+     */
+    private fun fitToWidth(physical: Point, width: Int): Point {
+        if (physical.x <= 0 || physical.y <= 0) return Point(width, width)
+        val portrait = physical.y >= physical.x
+        val shortSide = minOf(physical.x, physical.y)
+        val w = minOf(width, shortSide)
+        val h = (w.toDouble() * (if (portrait) physical.y else physical.x) / shortSide)
+            .roundToInt()
+            .let { if (it % 2 == 0) it else it + 1 }
+            .coerceAtMost(maxOf(physical.x, physical.y))
+        return if (portrait) Point(w, h) else Point(h, w)
+    }
+
     /** Framebuffer size the X server should allocate for the selected resolution profile. */
     fun effectiveSize(context: Context): Point {
         val physical = physicalSize(context)
@@ -85,8 +101,12 @@ object DisplayProfile {
         val long = maxOf(physical.x, physical.y)
         val short = minOf(physical.x, physical.y)
         return when (mode(context)) {
-            MODE_1080P -> if (portrait) Point(1080, 1920) else Point(1920, 1080)
-            MODE_1440P -> if (portrait) Point(1440, 2560) else Point(2560, 1440)
+            // Fixed-width presets keep the panel aspect ratio. Hardcoding 1080x1920 or
+            // 1440x2560 stretched the desktop on 16:10-ish tablets and, at 1440p, asked the
+            // X server for a framebuffer larger than the panel, which made libXlorie fail to
+            // start (the launch then ended on the loading screen).
+            MODE_1080P -> fitToWidth(physical, 1080)
+            MODE_1440P -> fitToWidth(physical, 1440)
             MODE_ONE_TO_ONE -> if (physical.x > 0 && physical.y > 0) {
                 Point(physical.x, physical.y)
             } else {
