@@ -1245,7 +1245,10 @@ class LinuxRuntime(private val context: Context) {
         val startedAt = System.currentTimeMillis()
         fun mark(step: String) = DesktopLog.event(context, "GRAPHICS", step, startedAt)
         mark("check begin")
-        val mesaInstalled = isDpkgPackageInstalled("mesa")
+        // File presence is a millisecond check; dpkg-query spawns a shell (and can be
+        // routed into a leftover interactive process), which used to trigger a full
+        // "pkg install" on every launch and added ~40 s to boot.
+        val mesaInstalled = mesaPresent() || isDpkgPackageInstalled("mesa")
         mark("mesa installed=$mesaInstalled")
         if (!mesaInstalled) {
             onProgress?.invoke(progress, "Installing Mesa graphics runtime...")
@@ -1284,6 +1287,13 @@ class LinuxRuntime(private val context: Context) {
             Log.i(TAG, "Graphics mode: Mesa llvmpipe software rendering")
         }
         return true
+    }
+
+    /** Fast, shell-free proof that the Mesa runtime files are already on disk. */
+    private fun mesaPresent(): Boolean {
+        val lib = File(prefixDir, "lib")
+        val gallium = lib.listFiles { f -> f.name.startsWith("libgallium-") && f.name.endsWith(".so") }
+        return gallium?.isNotEmpty() == true || File(lib, "libGL.so.1").isFile
     }
 
     /**
@@ -2091,7 +2101,7 @@ class LinuxRuntime(private val context: Context) {
         }
 
         val clipboardTool = File(binDir, "xclip")
-        if (!clipboardTool.canExecute()) {
+        if (!clipboardTool.isFile) {
             Log.i(TAG, "Installing the desktop clipboard compatibility helper")
             if (installPackageGroup("pkg install -y xclip")) {
                 patchShebangs(force = true)
@@ -2103,7 +2113,7 @@ class LinuxRuntime(private val context: Context) {
         if (selectedDesktop == "xfce4") {
             onPhase("应用桌面配置")
             // Older installs predate the auto-maximize helper; try once while upgrading the profile.
-            if (XfceMobileProfile.needsInstall(homeDir) && !File(binDir, "devilspie2").canExecute()) {
+            if (!File(binDir, "devilspie2").isFile) {
                 Log.i(TAG, "Installing the window fitting helper")
                 if (installPackageGroup("pkg install -y devilspie2")) {
                     patchShebangs(force = true)

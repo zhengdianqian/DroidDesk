@@ -51,6 +51,7 @@ import com.orailnoor.droiddesk.runtime.DisplayProfile
 import com.orailnoor.droiddesk.runtime.DesktopLog
 import com.orailnoor.droiddesk.runtime.PhantomGuard
 import com.orailnoor.droiddesk.x11.X11ServiceClient
+import com.orailnoor.droiddesk.x11.X11ServerService
 import com.orailnoor.droiddesk.x11.X11InputController
 import com.orailnoor.droiddesk.runtime.AndroidAppSync
 import java.io.File
@@ -101,6 +102,7 @@ class DesktopActivity : Activity() {
     private val activityStartedAt = System.currentTimeMillis()
     @Volatile private var sessionAborted = false
     @Volatile private var x11Connected = false
+    private var x11RetryCount = 0
     private val loadingMessageHandler = Handler(Looper.getMainLooper())
     private var loadingMessageIndex = 0
     private var loadingStartedAt = 0L
@@ -1164,6 +1166,27 @@ class DesktopActivity : Activity() {
     private fun showX11Error(message: String, error: Throwable?) {
         Log.e(TAG, message, error)
         DesktopLog.append(this, TAG, "X11 error: $message ${error?.message ?: ""}")
+        // A previous session can leave the display socket (or a half-dead server
+        // process) behind, which makes the next launch fail exactly like this. Clean
+        // it once and reconnect before showing the failure page.
+        if (x11RetryCount < 1) {
+            x11RetryCount++
+            DesktopLog.append(this, TAG, "X11 retry 1 after cleaning stale server state")
+            Thread {
+                runCatching { stopService(Intent(this, X11ServerService::class.java)) }
+                val sockets = File(filesDir, "tmp/.X11-unix")
+                runCatching { sockets.listFiles()?.forEach { it.delete() } }
+                runCatching { File(filesDir, "tmp/.X11-unix/X0").delete() }
+                runCatching { File(filesDir, "tmp/.X11-unix/.X0-lock").delete() }
+                Thread.sleep(1_500)
+                runOnUiThread {
+                    x11Connected = false
+                    Toast.makeText(this, "正在清理残留 X 服务器并重试…", Toast.LENGTH_SHORT).show()
+                    connectToX11Service()
+                }
+            }.start()
+            return
+        }
         Toast.makeText(this, "X11 Error: $message", Toast.LENGTH_LONG).show()
         if (sessionStartInFlight || shouldStartSession) {
             showSessionFailure("X 服务器启动失败：$message${error?.message?.let { "（$it）" } ?: ""}")
