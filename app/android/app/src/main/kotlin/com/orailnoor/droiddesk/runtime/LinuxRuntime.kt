@@ -2129,11 +2129,21 @@ class LinuxRuntime(private val context: Context) {
                     ".local/share/backgrounds/droiddesk-ubuntu-touch.jpg",
                 ),
             )
-            AndroidAppBridge.syncLaunchers(
-                context = context,
-                homeDir = homeDir,
-                python = File(prefixDir, "bin/python3"),
-            )
+            // Enumerating every installed Android app through python costs ~40 s and
+            // changes rarely, so refresh at most once every six hours.
+            val syncMarker = File(baseDir, ".android_apps_synced")
+            val syncFresh = syncMarker.isFile &&
+                (System.currentTimeMillis() - syncMarker.lastModified()) < 6 * 60 * 60 * 1000L
+            if (!syncFresh) {
+                AndroidAppBridge.syncLaunchers(
+                    context = context,
+                    homeDir = homeDir,
+                    python = File(prefixDir, "bin/python3"),
+                )
+                runCatching { syncMarker.writeText(System.currentTimeMillis().toString()) }
+            } else {
+                DesktopLog.append(context, TAG, "android launcher sync skipped (cache fresh)")
+            }
         }
 
         // X11ServerService owns this socket. Never delete it from the client runtime.
@@ -2283,6 +2293,16 @@ class LinuxRuntime(private val context: Context) {
             fi
 
             echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."
+            display_ready=0
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+                if command -v xdpyinfo >/dev/null 2>&1; then
+                    DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && { display_ready=1; break; }
+                elif [ -S /tmp/.X11-unix/X0 ]; then
+                    display_ready=1; break
+                fi
+                sleep 0.25
+            done
+            echo "DIAG: display ready=${'$'}display_ready"
             exec $desktopCommand
         """.trimIndent()
 
