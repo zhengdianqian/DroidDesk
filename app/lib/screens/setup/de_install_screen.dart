@@ -39,7 +39,7 @@ class _DEInstallScreenState extends State<DEInstallScreen> {
   }
 
   void _launchUrl() async {
-    final url = Uri.parse('https://www.youtube.com/orailnoor');
+    final url = Uri.parse('https://github.com/zhengdianqian/DroidDesk');
     if (await canLaunchUrl(url)) {
       await launchUrl(url, mode: LaunchMode.externalApplication);
     }
