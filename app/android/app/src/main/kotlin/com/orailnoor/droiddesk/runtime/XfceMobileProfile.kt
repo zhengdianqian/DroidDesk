@@ -6,22 +6,26 @@ import java.io.File
 import kotlin.math.roundToInt
 
 /**
- * Touch-friendly Ubuntu-inspired XFCE defaults.
+ * Touch-friendly Ubuntu 24.04-inspired XFCE defaults.
  *
- * Layout: a persistent top bar (app menu, window buttons, tray, clock) plus a bottom
- * launcher dock (store, terminal, files, browser). All sizes scale from [BASE_*] by the
- * user's UI scale so the panels stay usable on both phones and tablets.
+ * Layout: a dark Ubuntu-style top bar (app menu, window buttons, tray, clock) plus a
+ * vertical left dock, like Ubuntu's launcher on a rotated phone. All sizes scale from
+ * [BASE_*] by the user's UI scale so the panels stay usable on both phones and tablets.
  *
- * The profile is rewritten when the scale or the power mode changes; the marker name
- * encodes both, so a settings change is picked up on the next session start.
+ * Everything here targets software rendering (llvmpipe): the compositor stays off, GTK
+ * animations stay off, and icons use the light Yaru theme when it is installed (falling
+ * back to Papirus). No GPU effects, no frame-budget hogs.
+ *
+ * The profile is rewritten when the scale, power mode or icon theme changes; the marker
+ * name encodes all of them, so a settings change is picked up on the next session start.
  */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_VERSION = "v18"
+    private const val PROFILE_VERSION = "v19"
     private const val MONOSPACE_FONT = "DejaVu Sans Mono"
     private const val WALLPAPER_ASSET = "droiddesk/sunset-wave-wallpaper.jpg"
 
-    /** Height of the bottom launcher dock at the reference scale (1.5x). */
+    /** Width of the vertical left launcher dock at the reference scale (1.5x). */
     const val BASE_DOCK_SIZE_PX = 88
     const val BASE_TOP_BAR_SIZE_PX = 46
     private const val REFERENCE_SCALE = 1.5
@@ -31,15 +35,16 @@ object XfceMobileProfile {
     fun dockHeightPx(uiScale: Double): Int =
         (BASE_DOCK_SIZE_PX * scaleFactor(uiScale)).roundToInt()
 
-    private fun markerName(uiScale: Double, powerMode: String): String =
-        ".droiddesk-xfce-mobile-$PROFILE_VERSION-${uiScale}-$powerMode"
+    private fun markerName(uiScale: Double, powerMode: String, iconTheme: String): String =
+        ".droiddesk-xfce-mobile-$PROFILE_VERSION-${uiScale}-$powerMode-$iconTheme"
 
     /** True when the profile for the current scale/power mode is not installed yet. */
     fun needsInstall(
         homeDir: File,
         uiScale: Double = 1.5,
         powerMode: String = "standard",
-    ): Boolean = !File(homeDir, markerName(uiScale, powerMode)).exists()
+        iconTheme: String = "Papirus",
+    ): Boolean = !File(homeDir, markerName(uiScale, powerMode, iconTheme)).exists()
 
     fun install(
         context: Context,
@@ -48,8 +53,9 @@ object XfceMobileProfile {
         wallpaperPathInSession: String = wallpaperFile.absolutePath,
         uiScale: Double = 1.5,
         powerMode: String = "standard",
+        iconTheme: String = "Papirus",
     ): Boolean {
-        val marker = File(homeDir, markerName(uiScale, powerMode))
+        val marker = File(homeDir, markerName(uiScale, powerMode, iconTheme))
         if (marker.exists()) return true
 
         return try {
@@ -60,7 +66,6 @@ object XfceMobileProfile {
 
             val s = scaleFactor(uiScale)
             val dpi = DisplayProfile.xftDpi(uiScale)
-            val compositing = powerMode != "saver"
 
             val xfconfDir = File(
                 homeDir,
@@ -70,19 +75,21 @@ object XfceMobileProfile {
             File(xfconfDir, "xfce4-desktop.xml").writeText(
                 desktopConfig(xmlEscape(wallpaperPathInSession), s),
             )
-            File(xfconfDir, "xfwm4.xml").writeText(windowManagerConfig(s, compositing))
-            File(xfconfDir, "xsettings.xml").writeText(xsettingsConfig(dpi, s))
+            File(xfconfDir, "xfwm4.xml").writeText(windowManagerConfig(s))
+            File(xfconfDir, "xsettings.xml").writeText(
+                xsettingsConfig(dpi, s, iconTheme),
+            )
             File(xfconfDir, "xfce4-terminal.xml").writeText(terminalConfig())
             installMonospaceFontRule(homeDir)
             installPanelCss(homeDir, s)
             installAutoMaximize(homeDir)
-            installGtkSettings(homeDir, compositing)
+            installGtkSettings(homeDir, animations = false)
 
             val panelDir = File(homeDir, ".config/xfce4/panel")
             writeLauncher(
                 File(panelDir, "launcher-21/droiddesk-store.desktop"),
-                name = "App Store",
-                comment = "Install Linux applications and .deb packages",
+                name = "Ubuntu Software",
+                comment = "Install Linux applications and .deb packages (apt front end)",
                 exec = "/usr/local/bin/droiddesk-store",
                 icon = "system-software-install",
             )
@@ -91,21 +98,21 @@ object XfceMobileProfile {
                 name = "Terminal",
                 comment = "Open the Linux terminal",
                 exec = "xfce4-terminal",
-                icon = "org.xfce.terminalemulator",
+                icon = "utilities-terminal",
             )
             writeLauncher(
                 File(panelDir, "launcher-23/droiddesk-files.desktop"),
                 name = "Files",
                 comment = "Browse files",
                 exec = "thunar %u",
-                icon = "org.xfce.filemanager",
+                icon = "system-file-manager",
             )
             writeLauncher(
                 File(panelDir, "launcher-24/droiddesk-browser.desktop"),
                 name = "Web Browser",
                 comment = "Browse the web",
                 exec = "exo-open --launch WebBrowser %u",
-                icon = "org.xfce.webbrowser",
+                icon = "web-browser",
             )
             writeLauncher(
                 File(panelDir, "launcher-25/droiddesk-settings.desktop"),
@@ -117,13 +124,15 @@ object XfceMobileProfile {
             // Desktop shortcut for the store, so it is reachable without the dock.
             writeLauncher(
                 File(homeDir, "Desktop/droiddesk-store.desktop"),
-                name = "App Store",
+                name = "Ubuntu Software",
                 comment = "Install Linux applications",
                 exec = "/usr/local/bin/droiddesk-store",
                 icon = "system-software-install",
             )
 
-            marker.writeText("uiScale=$uiScale\npowerMode=$powerMode\n")
+            marker.writeText(
+                "uiScale=$uiScale\npowerMode=$powerMode\niconTheme=$iconTheme\n",
+            )
             Log.i(TAG, "Installed XFCE mobile profile ($PROFILE_VERSION scale=$uiScale mode=$powerMode)")
             true
         } catch (error: Exception) {
@@ -203,6 +212,8 @@ object XfceMobileProfile {
             }
             .xfce4-panel .tasklist button {
               min-width: ${(34 * s).roundToInt()}px;
+              /* The dock is vertical now, so touch target height matters too. */
+              min-height: ${(34 * s).roundToInt()}px;
             }
             $endMarker
         """.trimIndent()
@@ -255,7 +266,11 @@ object XfceMobileProfile {
         }
     }
 
-    private fun windowManagerConfig(s: Double, compositing: Boolean): String {
+    /**
+     * Software rendering only: no compositor in any power mode (double-buffered repaint is
+     * the "compositor off" fix for Firefox video flicker), no box animations, no cycle popups.
+     */
+    private fun windowManagerConfig(s: Double): String {
         val titleSize = (11 * s).roundToInt().coerceAtLeast(9)
         return """
             <?xml version="1.1" encoding="UTF-8"?>
@@ -271,7 +286,7 @@ object XfceMobileProfile {
                 <property name="wrap_windows" type="bool" value="false"/>
                 <property name="easy_click" type="string" value="Alt"/>
                 <property name="show_dock_shadow" type="bool" value="false"/>
-                <property name="use_compositing" type="bool" value="$compositing"/>
+                <property name="use_compositing" type="bool" value="false"/>
                 <property name="box_move" type="bool" value="false"/>
                 <property name="box_resize" type="bool" value="false"/>
                 <property name="cycle_preview" type="bool" value="false"/>
@@ -280,8 +295,12 @@ object XfceMobileProfile {
         """.trimIndent() + "\n"
     }
 
-    private fun xsettingsConfig(dpi: Int, s: Double): String {
+    private fun xsettingsConfig(dpi: Int, s: Double, iconTheme: String): String {
         val cursor = (32 * s).roundToInt().coerceAtLeast(24)
+        // Ubuntu 24.04 look: dark widgets, Yaru icons when the package is installed (the
+        // installer preinstalls yaru-theme-icon). Papirus is the fallback already used by
+        // older profiles; Adwaita is the last resort so icons always resolve.
+        val themeName = if (iconTheme == "Yaru") "Yaru-dark" else "Adwaita-dark"
         return """
             <?xml version="1.1" encoding="UTF-8"?>
 
@@ -293,14 +312,14 @@ object XfceMobileProfile {
                 <property name="RGBA" type="string" value="rgb"/>
               </property>
               <property name="Net" type="empty">
-                <property name="ThemeName" type="string" value="Adwaita"/>
-                <property name="IconThemeName" type="string" value="Papirus"/>
+                <property name="ThemeName" type="string" value="$themeName"/>
+                <property name="IconThemeName" type="string" value="$iconTheme"/>
                 <property name="CursorSize" type="int" value="$cursor"/>
               </property>
               <property name="Gtk" type="empty">
                 <property name="CursorThemeSize" type="int" value="$cursor"/>
                 <property name="FontName" type="string" value="Sans ${(11 * s).roundToInt().coerceAtLeast(9)}"/>
-                <property name="ButtonImages" type="bool" value="false"/>
+                <property name="ButtonImages" type="bool" value="true"/>
                 <property name="DialogsUseHeader" type="bool" value="true"/>
                 <property name="MonospaceFontName" type="string" value="$MONOSPACE_FONT 10"/>
               </property>
@@ -344,8 +363,8 @@ object XfceMobileProfile {
         val topSize = (BASE_TOP_BAR_SIZE_PX * s).roundToInt()
         val topIcon = (30 * s).roundToInt()
         val dockSize = dockHeightPx(s * REFERENCE_SCALE)
-        val dockIcon = (60 * s).roundToInt()
-        // Power saver hides the dock until the pointer touches the bottom edge.
+        val dockIcon = (44 * s).roundToInt()
+        // Power saver hides the dock until the pointer touches the left edge.
         val dockAutohide = if (powerMode == "saver") 2 else 1
         return """
             <?xml version="1.1" encoding="UTF-8"?>
@@ -355,7 +374,9 @@ object XfceMobileProfile {
               <property name="panels" type="array">
                 <value type="int" value="1"/>
                 <value type="int" value="2"/>
-                <property name="dark-mode" type="bool" value="false"/>
+                <!-- Ubuntu 24.04 ships a dark top bar; the light one looked nothing like
+                     it and its tasklist labels were unreadable on a phone. -->
+                <property name="dark-mode" type="bool" value="true"/>
                 <property name="panel-1" type="empty">
                   <property name="position" type="string" value="p=6;x=0;y=0"/>
                   <!-- length is a percentage while length-adjust is on: 1 meant the top
@@ -368,10 +389,10 @@ object XfceMobileProfile {
                   <property name="icon-size" type="uint" value="$topIcon"/>
                   <property name="background-style" type="uint" value="1"/>
                   <property name="background-rgba" type="array">
-                    <value type="double" value="0.965000"/>
-                    <value type="double" value="0.961000"/>
-                    <value type="double" value="0.957000"/>
-                    <value type="double" value="0.000000"/>
+                    <value type="double" value="0.106000"/>
+                    <value type="double" value="0.106000"/>
+                    <value type="double" value="0.106000"/>
+                    <value type="double" value="0.940000"/>
                   </property>
                   <property name="plugin-ids" type="array">
                     <value type="int" value="20"/>
@@ -382,9 +403,13 @@ object XfceMobileProfile {
                   </property>
                 </property>
                 <property name="panel-2" type="empty">
-                  <property name="position" type="string" value="p=10;x=0;y=0"/>
-                  <property name="mode" type="uint" value="0"/>
-                  <!-- Same unit as panel-1: the dock was only 1% wide before. -->
+                  <!-- Ubuntu-style launcher: left edge, vertical, full height. p=2 is
+                       xfce4-panel's left snap position; mode=1 makes the plugins stack
+                       top-to-bottom instead of a horizontal strip. -->
+                  <property name="position" type="string" value="p=2;x=0;y=0"/>
+                  <property name="mode" type="uint" value="1"/>
+                  <!-- For a vertical panel "size" is the dock WIDTH; "length" is the
+                       height percentage, same unit as panel-1. -->
                   <property name="length" type="uint" value="100"/>
                   <property name="length-adjust" type="bool" value="true"/>
                   <property name="position-locked" type="bool" value="true"/>
@@ -393,10 +418,10 @@ object XfceMobileProfile {
                   <property name="icon-size" type="uint" value="$dockIcon"/>
                   <property name="background-style" type="uint" value="1"/>
                   <property name="background-rgba" type="array">
-                    <value type="double" value="0.180000"/>
-                    <value type="double" value="0.180000"/>
-                    <value type="double" value="0.190000"/>
-                    <value type="double" value="0.920000"/>
+                    <value type="double" value="0.110000"/>
+                    <value type="double" value="0.110000"/>
+                    <value type="double" value="0.120000"/>
+                    <value type="double" value="0.880000"/>
                   </property>
                   <property name="plugin-ids" type="array">
                     <value type="int" value="21"/>

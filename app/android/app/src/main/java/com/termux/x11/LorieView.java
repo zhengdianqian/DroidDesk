@@ -731,6 +731,10 @@ public class LorieView extends SurfaceView implements InputStub {
 
         String name;
         int framerate = (int) (getDisplay() != null ? getDisplay().getRefreshRate() : 30);
+        Prefs prefs = MainActivity.getPrefs();
+        // DroidDesk power-saver cap (0 = follow the panel).
+        int framerateCap = prefs != null ? prefs.displayFramerateCap.get() : 0;
+        if (framerateCap > 0 && framerate > framerateCap) framerate = framerateCap;
 
         if (getDisplay() == null || getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY)
             name = "builtin";

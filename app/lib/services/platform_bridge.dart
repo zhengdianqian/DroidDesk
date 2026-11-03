@@ -379,8 +379,13 @@ class DroidDeskPlatform {
         false;
   }
 
-  static Future<void> stopLinux() async {
-    await _channel.invokeMethod('stopLinux');
+  /// Returns the native teardown verdict: `ok`, `running`, `message`, `wasRunning`.
+  /// The call always completes now (native side answers even on failure), so the UI can
+  /// tell the user what happened instead of leaving the button looking inert.
+  static Future<Map<String, dynamic>> stopLinux() async {
+    final result = await _channel.invokeMethod('stopLinux');
+    if (result is Map) return Map<String, dynamic>.from(result);
+    return <String, dynamic>{'ok': result == true, 'running': false, 'message': ''};
   }
 
   static Future<void> launchDesktopActivity() async {
@@ -449,6 +454,35 @@ class DroidDeskPlatform {
   }
 
   // ── Desktop crash journal ──
+
+  static Future<Map<String, dynamic>> startPreinstall() async {
+    final result = await _channel.invokeMethod('startPreinstall');
+    return _map(result);
+  }
+
+  static Future<Map<String, dynamic>> getPreinstallStatus() async {
+    final result = await _channel.invokeMethod('getPreinstallStatus');
+    return _map(result);
+  }
+
+  static Future<Map<String, dynamic>> retryPreinstall() async {
+    final result = await _channel.invokeMethod('retryPreinstall');
+    return _map(result);
+  }
+
+  static Map<String, dynamic> _map(dynamic value) =>
+      value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
+
+  static Future<bool> isDesktopLogEnabled() async {
+    return await _channel.invokeMethod<bool>('isDesktopLogEnabled') ?? false;
+  }
+
+  static Future<bool> setDesktopLogEnabled(bool enabled) async {
+    return await _channel.invokeMethod<bool>('setDesktopLogEnabled', {
+          'enabled': enabled,
+        }) ??
+        enabled;
+  }
 
   static Future<String> getDesktopLog() async {
     return await _channel.invokeMethod<String>('getDesktopLog') ?? '';

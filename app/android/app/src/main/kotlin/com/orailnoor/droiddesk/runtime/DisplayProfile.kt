@@ -150,6 +150,9 @@ object DisplayProfile {
                 displayResolutionCustom.put("${target.x}x${target.y}")
                 displayStretch.put(true)
             }
+            // Software rendering cannot sustain a 120 Hz full-screen video repaint; the
+            // saver profile caps the server at 60 fps. Standard keeps the panel rate.
+            displayFramerateCap.put(if (powerMode(context) == "saver") 60 else 0)
         }
     }
 

@@ -135,6 +135,14 @@ class ChrootRuntime(private val context: Context) {
                 export GALLIUM_DRIVER=llvmpipe
                 export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
 
+                # Firefox video flicker: force the software presentation path and stop
+                # Mesa waiting for a vblank the Lorie X server never sends. Without
+                # vblank_mode=0 every swap blocks or tears, which showed up as flashing.
+                export vblank_mode=0
+                export MOZ_ENABLE_WAYLAND=0
+                export MOZ_X11_EGL=0
+                export MOZ_DISABLE_CONTENT_SANDBOX=1
+
                 # Disable accessibility bus spam
                 export NO_AT_BRIDGE=1
                 export GTK_A11Y=none
@@ -423,13 +431,15 @@ class ChrootRuntime(private val context: Context) {
         // version marker lives there rather than in the root-owned chroot home.
         val uiScale = DisplayProfile.uiScale(context)
         val powerMode = DisplayProfile.powerMode(context)
+        val iconTheme = chrootIconTheme()
         val upgradingXfceProfile = desktopEnv == "xfce4" &&
             XfceMobileProfile.needsInstall(
                 File(context.cacheDir, "droiddesk-xfce-profile/root"),
                 uiScale,
                 powerMode,
+                iconTheme,
             )
-        if (desktopEnv == "xfce4") installChrootXfceMobileProfile(uiScale, powerMode)
+        if (desktopEnv == "xfce4") installChrootXfceMobileProfile(uiScale, powerMode, iconTheme)
         if (desktopEnv == "xfce4") {
             runCatching {
                 AndroidAppBridge.syncLaunchers(
@@ -439,6 +449,10 @@ class ChrootRuntime(private val context: Context) {
                     sessionRoot = rootfsDir,
                 )
             }.onFailure { Log.w(TAG, "Android desktop launchers could not be refreshed", it) }
+            // Firefox video flicker fix: software-rendering prefs through Firefox's
+            // autoconfig hook (idempotent, no user profile files are touched).
+            runCatching { FirefoxTuning.installInChroot(context, rootfsDir, powerMode) }
+                .onFailure { Log.w(TAG, "Firefox tuning failed", it) }
         }
 
         onPhase("挂载运行环境")
@@ -693,7 +707,11 @@ SESSEOF
      * Ubuntu filesystem through su.  apt makes /root and /usr root-owned, so
      * writing the profile directly from Kotlin fails on real rooted devices.
      */
-    private fun installChrootXfceMobileProfile(uiScale: Double = 1.5, powerMode: String = "standard") {
+    private fun installChrootXfceMobileProfile(
+        uiScale: Double = 1.5,
+        powerMode: String = "standard",
+        iconTheme: String = "Papirus",
+    ) {
         val stagingDir = File(context.cacheDir, "droiddesk-xfce-profile")
         val stagingHome = File(stagingDir, "root")
         val stagingWallpaper = File(stagingDir, "ubuntu-touch.jpg")
@@ -706,6 +724,7 @@ SESSEOF
             wallpaperPathInSession = sessionWallpaper,
             uiScale = uiScale,
             powerMode = powerMode,
+            iconTheme = iconTheme,
         )
         if (!staged) {
             Log.w(TAG, "Could not stage the XFCE mobile profile; starting with stock XFCE")
@@ -791,6 +810,14 @@ SESSEOF
             false
         }
     }
+
+    /**
+     * Ubuntu 24's Yaru icon set when the preinstaller managed to install it, otherwise the
+     * Papirus set older profiles already carry. Checked on every profile write, so an
+     * existing install picks Yaru up as soon as the package arrives.
+     */
+    private fun chrootIconTheme(): String =
+        if (File(rootfsDir, "usr/share/icons/Yaru").isDirectory) "Yaru" else "Papirus"
 
     /**
      * Stop the chroot session and unmount bind mounts.
@@ -1124,7 +1151,9 @@ SESSEOF
 
             val storeDesktop = File(staging, "droiddesk-store.desktop")
             storeDesktop.writeText(desktopEntry(
-                name = "软件商店 / App Store",
+                // Ubuntu's own GNOME Software is snap-based and cannot run in proot, so this
+                // is the apt front end presented under the familiar "Ubuntu Software" name.
+                name = "Ubuntu 软件 / Ubuntu Software",
                 comment = "搜索并安装 apt 软件包，安装本地 .deb",
                 exec = "/usr/local/bin/droiddesk-store",
                 icon = "system-software-install",
@@ -1755,6 +1784,27 @@ SESSEOF
         } else {
             rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}")
         }
+    }
+
+    /**
+     * Command runner for the background preinstall queue. Unlike [execChroot] it returns the
+     * exit status to the caller and brackets the command with GNU `timeout`, so one hung
+     * download can never wedge the whole queue.
+     */
+    fun runProvisioningCommand(command: String, timeoutSeconds: Int): PreinstallQueue.ShellResult {
+        if (!hasRoot() || !isRootfsReady()) {
+            return PreinstallQueue.ShellResult(-1, "chroot 根文件系统尚未就绪")
+        }
+        val marker = "__DD_EXIT__"
+        val wrapped = "timeout ${timeoutSeconds}s /bin/bash -c ${shellQuote(command)}; echo $marker${'$'}?"
+        val output = executeCommand(wrapped)
+        val code = output.lineSequence()
+            .lastOrNull { it.startsWith(marker) }
+            ?.removePrefix(marker)
+            ?.trim()
+            ?.toIntOrNull()
+            ?: -1
+        return PreinstallQueue.ShellResult(code, output)
     }
 
     private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {

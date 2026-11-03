@@ -216,7 +216,25 @@ class HomeScreen extends StatelessWidget {
                                     : DroidTheme.primaryGradient,
                                 onTap: () async {
                                   if (state.isRunning) {
-                                    state.stopLinux();
+                                    // Always surface the verdict: success OR the native
+                                    // error text. A tap can no longer look like it did nothing.
+                                    final error = await state.stopLinux();
+                                    if (!context.mounted) return;
+                                    ScaffoldMessenger.of(context)
+                                      ..hideCurrentSnackBar()
+                                      ..showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            error ??
+                                                AppStrings.t(
+                                                  'home.snackbar.stopped',
+                                                ),
+                                          ),
+                                          backgroundColor: error == null
+                                              ? DroidTheme.primary
+                                              : DroidTheme.error,
+                                        ),
+                                      );
                                   } else {
                                     if (!state.isDEInstalled) {
                                       ScaffoldMessenger.of(
@@ -485,6 +503,30 @@ class HomeScreen extends StatelessWidget {
 
   // ── Dialogs ──
 
+  /// Shared path for every setting that only takes effect when the X session restarts
+  /// (framebuffer size, UI scale, compositor/power profile). Running sessions go through
+  /// the full native rebuild; idle ones just report that the next launch will use it.
+  Future<void> _rebuildDesktopForProfile(
+    BuildContext pageContext,
+    AppState state,
+    String runningMessage,
+  ) async {
+    if (state.isRunning) {
+      ScaffoldMessenger.of(pageContext)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(runningMessage)));
+      await state.restartDesktopForDisplay();
+    } else {
+      ScaffoldMessenger.of(pageContext)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(AppStrings.t('settings.display.resolution.restart')),
+          ),
+        );
+    }
+  }
+
   void _showSettings(BuildContext pageContext) {
     showModalBottomSheet(
       context: pageContext,
@@ -752,9 +794,21 @@ class HomeScreen extends StatelessWidget {
                               ('2.00', '2.0x'),
                             ],
                             selected: state.uiScale.toStringAsFixed(2),
-                            onSelected: (value) => state.setDisplayProfile(
-                              uiScale: double.tryParse(value) ?? 1.5,
-                            ),
+                            onSelected: (value) async {
+                              await state.setDisplayProfile(
+                                uiScale: double.tryParse(value) ?? 1.5,
+                              );
+                              // UI scale lives in the Xft/xsettings profile, exactly like
+                              // the framebuffer size: applying it to a live session leaves
+                              // stale metrics, dead input coordinates and a black screen.
+                              // Route it through the same full teardown+rebuild path.
+                              if (!pageContext.mounted) return;
+                              await _rebuildDesktopForProfile(
+                                pageContext,
+                                state,
+                                AppStrings.t('settings.display.scale.rebuilding'),
+                              );
+                            },
                           );
                         },
                       ),
@@ -781,8 +835,17 @@ class HomeScreen extends StatelessWidget {
                               ),
                             ],
                             selected: state.powerMode,
-                            onSelected: (value) =>
-                                state.setDisplayProfile(powerMode: value),
+                            onSelected: (value) async {
+                              await state.setDisplayProfile(powerMode: value);
+                              // Compositor/animation/panel profile is written at session
+                              // start, so a live session keeps the old mode until rebuilt.
+                              if (!pageContext.mounted) return;
+                              await _rebuildDesktopForProfile(
+                                pageContext,
+                                state,
+                                AppStrings.t('settings.display.power.rebuilding'),
+                              );
+                            },
                           );
                         },
                       ),
@@ -826,12 +889,36 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
                       _SettingsRow(
+                        icon: Icons.receipt_long_rounded,
+                        color: DroidTheme.accent,
+                        title: AppStrings.t('settings.stability.logEnabled.title'),
+                        subtitle: AppStrings.t(
+                          'settings.stability.logEnabled.subtitle',
+                        ),
+                        trailing: Switch.adaptive(
+                          value: state.desktopLogEnabled,
+                          activeThumbColor: Colors.white,
+                          activeTrackColor: DroidTheme.accent,
+                          inactiveThumbColor: Colors.white,
+                          inactiveTrackColor: DroidTheme.surfaceBorder,
+                          trackOutlineColor:
+                              const WidgetStatePropertyAll(Colors.transparent),
+                          onChanged: (value) =>
+                              state.setDesktopLogEnabled(value),
+                        ),
+                        onTap: () => state.setDesktopLogEnabled(
+                          !state.desktopLogEnabled,
+                        ),
+                      ),
+                      _SettingsRow(
                         icon: Icons.article_rounded,
                         color: DroidTheme.secondary,
                         title: AppStrings.t('settings.stability.log.title'),
-                        subtitle: AppStrings.t(
-                          'settings.stability.log.subtitle',
-                        ),
+                        subtitle: state.desktopLogEnabled
+                            ? AppStrings.t('settings.stability.log.subtitle')
+                            : AppStrings.t(
+                                'settings.stability.log.offSubtitle',
+                              ),
                         onTap: () {
                           Navigator.pop(sheetContext);
                           _showDesktopLog(pageContext, state);
@@ -944,6 +1031,29 @@ class HomeScreen extends StatelessWidget {
                           ScaffoldMessenger.of(pageContext).showSnackBar(
                             SnackBar(content: Text(message)),
                           );
+                        },
+                      ),
+                      _SettingsRow(
+                        icon: Icons.apps_rounded,
+                        color: const Color(0xFF30D158),
+                        title: AppStrings.t('settings.preinstall.title'),
+                        subtitle: state.preinstallSummary.isEmpty
+                            ? AppStrings.t('settings.preinstall.subtitle')
+                            : AppStrings.t(
+                                'settings.preinstall.progress',
+                                args: {
+                                  'done':
+                                      '${state.preinstallSummary['done'] ?? 0}',
+                                  'total':
+                                      '${state.preinstallSummary['total'] ?? 0}',
+                                  'skipped':
+                                      '${state.preinstallSummary['skipped'] ?? 0}',
+                                },
+                              ),
+                        onTap: () async {
+                          await state.refreshPreinstallStatus();
+                          if (!pageContext.mounted) return;
+                          _showPreinstallStatus(pageContext, state);
                         },
                       ),
                     ],
@@ -1264,6 +1374,94 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  void _showPreinstallStatus(BuildContext pageContext, AppState state) {
+    showDialog<void>(
+      context: pageContext,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final steps = state.preinstallSteps;
+          return AlertDialog(
+            title: Text(AppStrings.t('settings.preinstall.title')),
+            content: SizedBox(
+              width: 520,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      AppStrings.t('settings.preinstall.hint'),
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    const SizedBox(height: 12),
+                    for (final step in steps) ...[
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            switch (step['state']) {
+                              'done' => Icons.check_circle_rounded,
+                              'failed' => Icons.error_rounded,
+                              'skipped' => Icons.remove_circle_outline_rounded,
+                              _ => Icons.pending_outlined,
+                            },
+                            size: 18,
+                            color: switch (step['state']) {
+                              'done' => DroidTheme.primary,
+                              'failed' => DroidTheme.error,
+                              _ => DroidTheme.textSecondary,
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  step['title']?.toString() ?? '',
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                                if ((step['message']?.toString() ?? '')
+                                    .isNotEmpty)
+                                  Text(
+                                    step['message'].toString(),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: DroidTheme.textSecondary,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                    ],
+                    if (steps.isEmpty)
+                      Text(AppStrings.t('settings.preinstall.subtitle')),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: Text(AppStrings.t('common.close')),
+              ),
+              TextButton(
+                onPressed: () async {
+                  await state.retryPreinstall();
+                  setDialogState(() {});
+                },
+                child: Text(AppStrings.t('settings.preinstall.retry')),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _showDesktopLog(BuildContext pageContext, AppState state) async {
     await state.loadDesktopLog();
     if (!pageContext.mounted) return;
@@ -1276,7 +1474,9 @@ class HomeScreen extends StatelessWidget {
           height: 360,
           child: SingleChildScrollView(
             child: SelectableText(
-              state.desktopLog.isEmpty
+              !state.desktopLogEnabled
+                  ? AppStrings.t('settings.stability.log.off')
+                  : state.desktopLog.isEmpty
                   ? AppStrings.t('settings.stability.log.empty')
                   : state.desktopLog,
               style: const TextStyle(fontFamily: 'monospace', fontSize: 11),

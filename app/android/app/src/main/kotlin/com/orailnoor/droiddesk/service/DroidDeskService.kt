@@ -15,6 +15,7 @@ import androidx.core.app.ServiceCompat
 import com.orailnoor.droiddesk.MainActivity
 import com.orailnoor.droiddesk.runtime.AndroidAppBridge
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
+import com.orailnoor.droiddesk.runtime.DesktopLog
 import com.orailnoor.droiddesk.runtime.LinuxRuntime
 import com.orailnoor.droiddesk.view.DesktopActivity
 import com.orailnoor.droiddesk.x11.X11ServerService
@@ -74,20 +75,40 @@ class DroidDeskService : Service() {
 
     /** Same teardown as the Flutter "stopLinux" call, triggered from the notification. */
     private fun stopDesktop() {
-        if (stopping) return
+        // The flag used to stay true forever when the worker died midway, which made every
+        // later tap on "Stop" a silent no-op until the process was recreated.
+        if (stopping) {
+            DesktopLog.append(this, TAG, "stopDesktop ignored: previous stop still in flight")
+            return
+        }
         stopping = true
-        DesktopActivity.finishIfOpen()
+        DesktopLog.append(this, TAG, "stopDesktop requested from notification")
+        // A bound X11 service survives stopService; unbind the screen first.
+        runCatching { DesktopActivity.teardownAndAwait(2_000) }
         thread(name = "notification-stop-linux") {
+            var failure: String? = null
             try {
                 val chrootRuntime = ChrootRuntime(this)
-                if (chrootRuntime.isRunning()) chrootRuntime.stopSession()
+                if (chrootRuntime.hasRoot() && chrootRuntime.isRunning()) {
+                    chrootRuntime.stopSession()
+                }
                 LinuxRuntime(this).stopSession()
                 stopService(Intent(this, X11ServerService::class.java))
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
+                failure = error.message ?: error.javaClass.simpleName
                 Log.e(TAG, "Failed to stop the Linux desktop from the notification", error)
+            } finally {
+                DesktopLog.append(this, TAG, "stopDesktop finished, failure=$failure")
+                // Keep the notification truthful: on failure the service stays alive and the
+                // button stays clickable instead of pretending the desktop was stopped.
+                if (failure == null) {
+                    runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
+                    runCatching { stopSelf() }
+                } else {
+                    stopping = false
+                    runCatching { updateNotification("停止失败：$failure") }
+                }
             }
-            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
     }
 

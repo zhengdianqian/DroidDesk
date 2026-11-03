@@ -118,6 +118,13 @@ class MainActivity : FlutterActivity() {
                 if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
             }
         }.getOrNull() ?: "droiddesk-install.deb"
+        // Keep the grant across process restarts; harmless when the provider does not offer it.
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
         installThread("install-deb") {
             val messenger = flutterEngine?.dartExecutor?.binaryMessenger
             val progress: (Double, String) -> Unit = { value, status ->
@@ -150,6 +157,15 @@ class MainActivity : FlutterActivity() {
                         "ok" to false,
                         "message" to "无法读取所选文件：请重新选择 .deb（文件可能已被移动或没有读取权限）",
                     )
+                } else if (!looksLikeDebPackage(target)) {
+                    // A picker opened with */* happily returns a .jpg or a .txt; validate the
+                    // real bytes (deb is an `ar` archive starting with "!<arch>") instead of
+                    // trusting the provider's MIME type.
+                    target.delete()
+                    mapOf(
+                        "ok" to false,
+                        "message" to "所选文件不是有效的 .deb 安装包（文件头不以 !<arch> 开头）",
+                    )
                 } else if (chrootRuntime.hasRoot()) {
                     val ok = chrootRuntime.installDeb(target, progress, log)
                     mapOf("ok" to ok, "name" to displayName)
@@ -167,6 +183,29 @@ class MainActivity : FlutterActivity() {
             runOnUiThread { pending?.success(outcome) }
         }
     }
+
+    /**
+     * A .deb is a Unix `ar` archive whose first bytes are "!<arch>". Some providers report a
+     * wrong or missing MIME type and name, so the header is the reliable check.
+     */
+    private fun looksLikeDebPackage(file: java.io.File): Boolean {
+        val header = runCatching {
+            file.inputStream().use { input ->
+                val buffer = ByteArray(8)
+                if (input.read(buffer) < buffer.size) "" else String(buffer, Charsets.US_ASCII)
+            }
+        }.getOrDefault("")
+        return header.startsWith("!<arch>")
+    }
+
+    private var preinstall: com.orailnoor.droiddesk.runtime.PreinstallQueue? = null
+
+    private fun preinstallQueue(): com.orailnoor.droiddesk.runtime.PreinstallQueue =
+        preinstall ?: com.orailnoor.droiddesk.runtime.PreinstallQueue(this) { command, timeout ->
+            // Only the rooted chroot path can apt-install the optional apps; the native
+            // prefix already has its package set and is left untouched.
+            chrootRuntime.runProvisioningCommand(command, timeout)
+        }.also { preinstall = it }
 
     /** Optional "Auto-Start Linux Desktop" setting: open the chroot desktop whenever the app starts. */
     private fun maybeAutoStartDesktop(launchIntent: Intent) {
@@ -190,7 +229,6 @@ class MainActivity : FlutterActivity() {
         super.onResume()
         restoreSystemBars()
     }
-
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
@@ -958,16 +996,66 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopLinux" -> {
-                    // A desktop screen left in the back stack would reopen onto a dead session.
-                    com.orailnoor.droiddesk.view.DesktopActivity.finishIfOpen()
+                    // The stop button must never be a silent no-op: every path below
+                    // answers the Dart side with a structured result, including failures
+                    // and timeouts. The previous handler let an exception on the worker
+                    // thread skip result.success(), so the Flutter future never completed
+                    // and the button looked dead until the app was restarted.
                     thread(name = "stop-linux-session") {
-                        if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
-                            chrootRuntime.stopSession()
+                        val wasRunning = runCatching {
+                            if (chrootRuntime.hasRoot()) chrootRuntime.isRunning() else linuxRuntime.isRunning()
+                        }.getOrDefault(false)
+                        var failure: String? = null
+                        // Unbind the desktop screen first: a bound :x11 service survives
+                        // stopService and would keep the old framebuffer (and its guest)
+                        // alive, which is what made "stop" look like it did nothing.
+                        val activityGone = runCatching {
+                            com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(2_000)
+                        }.getOrDefault(false)
+                        runCatching {
+                            if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
+                                chrootRuntime.stopSession()
+                            }
+                        }.onFailure {
+                            failure = "chroot 会话停止失败：${it.message ?: it.javaClass.simpleName}"
+                            DesktopLog.append(this, TAG, "stopLinux chroot failure: ${it.message}")
                         }
-                        linuxRuntime.stopSession()
-                        stopService(Intent(this@MainActivity, X11ServerService::class.java))
-                        stopForegroundService()
-                        runOnUiThread { result.success(true) }
+                        runCatching { linuxRuntime.stopSession() }.onFailure {
+                            failure = failure ?: "Termux 会话停止失败：${it.message ?: it.javaClass.simpleName}"
+                            DesktopLog.append(this, TAG, "stopLinux native failure: ${it.message}")
+                        }
+                        runCatching {
+                            stopService(Intent(this@MainActivity, X11ServerService::class.java))
+                        }.onFailure {
+                            failure = failure ?: "X 服务停止失败：${it.message ?: it.javaClass.simpleName}"
+                        }
+                        runCatching { stopForegroundService() }.onFailure {
+                            failure = failure ?: "前台服务停止失败：${it.message ?: it.javaClass.simpleName}"
+                        }
+                        // Report the state that actually survived, not what we wished for.
+                        val stillRunning = runCatching {
+                            if (chrootRuntime.hasRoot()) chrootRuntime.isRunning() else linuxRuntime.isRunning()
+                        }.getOrDefault(false)
+                        if (stillRunning && failure == null) {
+                            failure = "会话仍在运行，请重试（进程可能卡在卸载挂载点）"
+                        }
+                        DesktopLog.append(
+                            this,
+                            "STOP",
+                            "stopLinux wasRunning=$wasRunning activityGone=$activityGone " +
+                                "stillRunning=$stillRunning failure=$failure",
+                        )
+                        runOnUiThread {
+                            result.success(
+                                mapOf(
+                                    "ok" to (failure == null && !stillRunning),
+                                    "wasRunning" to wasRunning,
+                                    "running" to stillRunning,
+                                    "activityGone" to activityGone,
+                                    "message" to (failure ?: ""),
+                                ),
+                            )
+                        }
                     }
                 }
 
@@ -1059,10 +1147,49 @@ class MainActivity : FlutterActivity() {
                     runOnUiThread { result.success(outcome) }
                 }
 
+                // ── Background preinstall queue (Chrome/QQ/WeChat/Trae/store) ──
+                "startPreinstall" -> {
+                    val queue = preinstallQueue()
+                    queue.isAvailable = chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()
+                    queue.startIfNeeded()
+                    result.success(queue.summary())
+                }
+
+                "getPreinstallStatus" -> {
+                    val queue = preinstallQueue()
+                    result.success(
+                        mapOf(
+                            "summary" to queue.summary(),
+                            "steps" to queue.status(),
+                        ),
+                    )
+                }
+
+                "retryPreinstall" -> {
+                    val queue = preinstallQueue()
+                    queue.isAvailable = chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()
+                    queue.retryFailed()
+                    result.success(queue.summary())
+                }
+
                 // ── Desktop crash journal ──
                 "getDesktopLog" -> thread(name = "desktop-log") {
                     val text = DesktopLog.read(this)
                     runOnUiThread { result.success(text) }
+                }
+
+                // Logging is opt-in. Both the native journal and Flutter's preference key
+                // share `flutter.ddDesktopLog` so the switch has a single source of truth.
+                "isDesktopLogEnabled" -> result.success(DesktopLog.isEnabled(this))
+
+                "setDesktopLogEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+                        .edit()
+                        .putBoolean("flutter.ddDesktopLog", enabled)
+                        .apply()
+                    DesktopLog.setEnabled(enabled)
+                    result.success(enabled)
                 }
 
                 "clearDesktopLog" -> {
@@ -1218,10 +1345,6 @@ class MainActivity : FlutterActivity() {
                         val activityGone = com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(3_000)
                         if (chrootRuntime.isRunning()) chrootRuntime.stopSession()
                         if (linuxRuntime.isRunning()) linuxRuntime.stopSession()
-                        // Write the new geometry to the X server preferences BEFORE the
-                        // old server dies, so the replacement reads the new size instead
-                        // of resurrecting the old framebuffer.
-                        DisplayProfile.applyToX11(this)
                         stopService(Intent(this@MainActivity, X11ServerService::class.java))
                         // The real socket lives in filesDir/tmp: X11ServerService sets
                         // TMPDIR to that directory, and LinuxRuntime binds it to /tmp.
@@ -1247,6 +1370,9 @@ class MainActivity : FlutterActivity() {
                         socket.delete()
                         java.io.File(x11Tmp, ".X11-unix").delete()
                         java.io.File(x11Tmp, ".X0-lock").delete()
+                        // Only once the old server really released the socket: writing the
+                        // new geometry earlier would be overwritten by the dying process.
+                        DisplayProfile.applyToX11(this)
                         val after = DisplayProfile.effectiveSize(this)
                         DesktopLog.append(
                             this@MainActivity,
@@ -1266,18 +1392,46 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "pickDebPackage" -> {
-                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    pendingDebResult = result
+                    // Do NOT send EXTRA_MIME_TYPES here: several ROM pickers and cloud
+                    // providers report .deb as application/x-debian-package, text/plain or
+                    // no type at all, and the narrow filter made the files invisible in the
+                    // picker (the "看不到文件" bug). Accept everything, then validate the
+                    // actual bytes after copying. Persistable permission keeps re-picks
+                    // working after a process restart.
+                    val openIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
-                        putExtra(
-                            Intent.EXTRA_MIME_TYPES,
-                            arrayOf("application/vnd.debian.binary-package", "application/octet-stream"),
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
                         )
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    pendingDebResult = result
-                    @Suppress("DEPRECATION")
-                    startActivityForResult(intent, DEB_PICK_REQUEST)
+                    val started = runCatching {
+                        startActivityForResult(openIntent, DEB_PICK_REQUEST)
+                    }.isSuccess
+                    if (!started) {
+                        // Fallback for devices whose DocumentsUI cannot serve OPEN_DOCUMENT.
+                        val legacy = Intent(Intent.ACTION_GET_CONTENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        val legacyStarted = runCatching {
+                            startActivityForResult(
+                                Intent.createChooser(legacy, "选择 .deb 安装包"),
+                                DEB_PICK_REQUEST,
+                            )
+                        }.isSuccess
+                        if (!legacyStarted) {
+                            pendingDebResult = null
+                            result.error(
+                                "deb_picker_unavailable",
+                                "系统文件选择器不可用，请安装“文件”或“文档”组件后重试",
+                                null,
+                            )
+                        }
+                    }
                 }
 
                 else -> result.notImplemented()

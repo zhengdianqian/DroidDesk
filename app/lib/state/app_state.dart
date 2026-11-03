@@ -69,6 +69,7 @@ class AppState extends ChangeNotifier {
   bool _autoIme = true;
   Map<String, dynamic> _displayInfo = {};
   String _desktopLog = '';
+  bool _desktopLogEnabled = false;
   Map<String, dynamic> _phantomStatus = {};
 
   String get resolutionMode => _resolutionMode;
@@ -78,6 +79,7 @@ class AppState extends ChangeNotifier {
   bool get autoIme => _autoIme;
   Map<String, dynamic> get displayInfo => _displayInfo;
   String get desktopLog => _desktopLog;
+  bool get desktopLogEnabled => _desktopLogEnabled;
   Map<String, dynamic> get phantomStatus => _phantomStatus;
 
   // ── Getters ──
@@ -232,6 +234,9 @@ class AppState extends ChangeNotifier {
     _uiScale = double.tryParse(prefs.getString('ddUiScale') ?? '') ?? 1.5;
     _powerMode = prefs.getString('ddPowerMode') ?? 'standard';
     _autoIme = prefs.getBool('ddAutoIme') ?? true;
+    // Opt-in: the native journal stays completely inert (no file, no thread) unless
+    // the user turns this switch on.
+    _desktopLogEnabled = prefs.getBool('ddDesktopLog') ?? false;
     await refreshDisplayInfo();
 
     if (_autoStartDesktop && isSetupComplete && !_isRunning) {
@@ -432,6 +437,52 @@ class AppState extends ChangeNotifier {
     return result;
   }
 
+  /// Persists the opt-in log switch and mirrors it into the native journal immediately.
+  Future<void> setDesktopLogEnabled(bool enabled) async {
+    _desktopLogEnabled = enabled;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('ddDesktopLog', enabled);
+    await DroidDeskPlatform.setDesktopLogEnabled(enabled);
+    if (!enabled) {
+      // Keep no stale file around for a user who turned logging back off.
+      _desktopLog = '';
+      notifyListeners();
+    }
+  }
+
+  /// Preinstall queue snapshot (background Chromium/QQ/WeChat/Trae/store install).
+  /// Read on demand from the settings sheet — no periodic polling anywhere.
+  Map<String, dynamic> get preinstallSummary => _preinstallSummary;
+  List<Map<String, dynamic>> get preinstallSteps => _preinstallSteps;
+  Map<String, dynamic> _preinstallSummary = {};
+  List<Map<String, dynamic>> _preinstallSteps = [];
+
+  Future<void> refreshPreinstallStatus() async {
+    try {
+      final result = await DroidDeskPlatform.getPreinstallStatus();
+      final summary = result['summary'];
+      final steps = result['steps'];
+      _preinstallSummary = summary is Map
+          ? Map<String, dynamic>.from(summary)
+          : <String, dynamic>{};
+      _preinstallSteps = steps is List
+          ? steps
+                .whereType<Map>()
+                .map((e) => Map<String, dynamic>.from(e))
+                .toList()
+          : <Map<String, dynamic>>[];
+      notifyListeners();
+    } catch (_) {
+      // A missing native side must not break the settings screen.
+    }
+  }
+
+  Future<void> retryPreinstall() async {
+    await DroidDeskPlatform.retryPreinstall();
+    await refreshPreinstallStatus();
+  }
+
   Future<String> loadDesktopLog() async {
     _desktopLog = await DroidDeskPlatform.getDesktopLog();
     notifyListeners();
@@ -606,6 +657,11 @@ class AppState extends ChangeNotifier {
 
       _isExtracting = false;
       _isInstallingDE = false;
+      // Fire-and-forget: the optional apps (Chromium/QQ/WeChat/Trae/store) install in a
+      // background serial queue and must never delay the desktop-ready state.
+      DroidDeskPlatform.startPreinstall().then((_) {
+        refreshPreinstallStatus();
+      }).catchError((_) {});
       await refreshStatus();
     } catch (e) {
       _errorMessage = AppStrings.t('state.error.installFailed', args: {'error': '$e'});
@@ -968,14 +1024,39 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> stopLinux() async {
+  /// True while a native teardown request is in flight; prevents double taps from
+  /// queueing two teardowns while still giving feedback to the second tap.
+  bool get isStopping => _isStopping;
+  bool _isStopping = false;
+
+  /// Runs the native teardown and reports what actually happened.
+  /// [stopLinux] never flips `isRunning` optimistically: the native result decides, so a
+  /// failed stop keeps showing "运行中" plus an explicit error instead of lying.
+  Future<String?> stopLinux() async {
+    if (_isStopping) {
+      return AppStrings.t('state.stopping');
+    }
+    _isStopping = true;
+    notifyListeners();
     try {
-      await DroidDeskPlatform.stopLinux();
-      _isRunning = false;
-      notifyListeners();
+      final result = await DroidDeskPlatform.stopLinux();
+      final ok = result['ok'] == true;
+      _isRunning = result['running'] == true;
+      if (ok) {
+        return null;
+      }
+      final message = (result['message'] as String?)?.trim();
+      _errorMessage = message == null || message.isEmpty
+          ? AppStrings.t('state.error.stopFailed', args: {'error': 'unknown'})
+          : message;
+      return _errorMessage;
     } catch (e) {
       _errorMessage = AppStrings.t('state.error.stopFailed', args: {'error': '$e'});
+      return _errorMessage;
+    } finally {
+      _isStopping = false;
       notifyListeners();
+      await refreshStatus();
     }
   }
 

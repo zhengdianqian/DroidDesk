@@ -113,6 +113,10 @@ class LinuxRuntime(private val context: Context) {
     private val baseDir: File get() = context.filesDir
     private val prefixDir: File get() = File(baseDir, "usr")
     private val binDir: File get() = File(prefixDir, "bin")
+
+    /** Yaru when the preinstaller got it, Papirus otherwise (both are icon themes, not themes). */
+    private fun installIconTheme(): String =
+        if (File(prefixDir, "share/icons/Yaru").isDirectory) "Yaru" else "Papirus"
     private val libDir: File get() = File(prefixDir, "lib")
     // Shared with X11ServerService. X clients resolve /tmp/.X11-unix/X0 here
     // through libsocket_hook, so this must not be $PREFIX/tmp.
@@ -1999,6 +2003,17 @@ class LinuxRuntime(private val context: Context) {
 
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=${tmpDir.absolutePath}/dbus-session"
 
+        // ── Firefox video flicker ──
+        // Video was presented through paths that do not exist here: X11-EGL, hardware
+        // decode and compositor VSync. These environment defaults make Firefox fall back to
+        // the software path deterministically instead of thrashing between them per frame.
+        // `vblank_mode=0` stops Mesa from blocking the swap on a vblank the Lorie X server
+        // never signals, which is what produced the flashing.
+        env["vblank_mode"] = "0"
+        env["MOZ_ENABLE_WAYLAND"] = "0"
+        env["MOZ_X11_EGL"] = "0"
+        env["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
+
         env["DPKG_ADMINDIR"] = "${prefixDir.absolutePath}/var/lib/dpkg"
         env["APT_CONFIG"] = "${prefixDir.absolutePath}/etc/apt/apt.conf.d/99-droiddesk-paths.conf"
 
@@ -3079,6 +3094,7 @@ class LinuxRuntime(private val context: Context) {
                 }
             }
             mark("profile:begin")
+            val powerMode = DisplayProfile.powerMode(context)
             XfceMobileProfile.install(
                 context = context,
                 homeDir = homeDir.apply { mkdirs() },
@@ -3090,8 +3106,12 @@ class LinuxRuntime(private val context: Context) {
                 // defaults to 1.5/standard, so without them choosing "saver" in the UI
                 // still installed animations and the compositor.
                 uiScale = DisplayProfile.uiScale(context),
-                powerMode = DisplayProfile.powerMode(context),
+                powerMode = powerMode,
+                iconTheme = installIconTheme(),
             )
+            // Firefox is already installed in most images; give it the software-rendering
+            // profile now, so the very first video playback does not flicker.
+            FirefoxTuning.installNative(context, prefixDir, powerMode)
             mark("profile:end")
             exportDesktopShortcuts()
             // Enumerating every installed Android app through python costs ~40 s and

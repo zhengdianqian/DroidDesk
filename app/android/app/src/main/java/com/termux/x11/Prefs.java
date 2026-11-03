@@ -33,6 +33,12 @@ public class Prefs {
     public Pref<String> displayResolutionCustom = new Pref<>("1080x1920");
     public Pref<Boolean> adjustResolution = new Pref<>(true);
     public Pref<Boolean> displayStretch = new Pref<>(true);
+    /**
+     * 0 = use the panel's refresh rate. DroidDesk sets 60 in the power-saver profile:
+     * llvmpipe cannot fill 120 frames per second of a full-screen video window, and the
+     * stutter/tearing that results is what the user perceived as flicker.
+     */
+    public Pref<Integer> displayFramerateCap = new Pref<>(0);
     public Pref<String> displayFilteringMode = new Pref<>("nearest");
     public Pref<Boolean> hardwareKbdScancodesWorkaround = new Pref<>(false);
     public Pref<Boolean> clipboardEnable = new Pref<>(true);

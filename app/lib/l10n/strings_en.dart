@@ -36,6 +36,12 @@ const Map<String, String> enStrings = {
   'home.action.launch.subtitle': 'Open your Desktop Environment',
   'home.snackbar.notInstalled':
       'Desktop Environment is not installed. Complete setup first.',
+  'home.snackbar.stopped': 'Desktop stopped',
+  'state.stopping': 'Stopping the desktop, please wait…',
+  'settings.display.scale.rebuilding':
+      'Rebuilding the desktop session for the new UI scale…',
+  'settings.display.power.rebuilding':
+      'Rebuilding the desktop session for the new power profile…',
   'home.action.terminal.title': 'Terminal',
   'home.action.terminal.subtitle': 'Open the Linux command line',
   'home.action.debian.title': 'Debian shell',
@@ -124,8 +130,24 @@ const Map<String, String> enStrings = {
       'Android 12+ limits background child processes. Enable “Disable child process restrictions” in developer options, or grant root to relax it here.',
   'settings.stability.phantom.relax': 'Relax the limit',
   'settings.stability.phantom.relaxed': 'Process limit relaxed',
+  'common.close': 'Close',
+  'settings.preinstall.title': 'Preinstalled apps',
+  'settings.preinstall.subtitle':
+      'Background serial install of Chromium, Trae, QQ, WeChat and the store entry',
+  'settings.preinstall.progress':
+      '{done}/{total} done, {skipped} skipped (tap for details)',
+  'settings.preinstall.hint':
+      'Installs run one by one in the background. A package without an arm64 build is skipped and recorded; other apps and the desktop are unaffected.',
+  'settings.preinstall.retry': 'Retry failed',
   'settings.stability.log.title': 'Desktop log',
   'settings.stability.log.subtitle': 'Full record of session crashes and failed installs',
+  'settings.stability.log.offSubtitle':
+      'Logging off (no files, no background thread by default)',
+  'settings.stability.log.off':
+      'Logging is off. Turn the switch above on to record session events.',
+  'settings.stability.logEnabled.title': 'Record debug log',
+  'settings.stability.logEnabled.subtitle':
+      'Enable only while troubleshooting; off means no file writes and no thread',
   'settings.stability.log.empty': 'No log entries yet',
   'settings.stability.log.clear': 'Clear log',
   'settings.stability.log.share': 'Export log',
