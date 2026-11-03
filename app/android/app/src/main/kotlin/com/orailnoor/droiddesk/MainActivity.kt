@@ -139,14 +139,26 @@ class MainActivity : FlutterActivity() {
                 val target = java.io.File(cacheDir, "droiddesk-install.deb").apply {
                     parentFile?.mkdirs()
                 }
-                contentResolver.openInputStream(uri)?.use { input ->
+                // content:// URIs are only readable through the granted URI permission, and
+                // neither the chroot nor dpkg can open them — stream to a real file first.
+                val copied = contentResolver.openInputStream(uri)?.use { input ->
                     target.outputStream().use(input::copyTo)
-                } ?: throw java.io.IOException("无法读取所选文件")
-                if (!chrootRuntime.hasRoot()) {
-                    mapOf("ok" to false, "message" to "deb 安装需要 root（chroot 运行时）")
-                } else {
+                    true
+                } ?: false
+                if (!copied || !target.isFile || target.length() == 0L) {
+                    mapOf(
+                        "ok" to false,
+                        "message" to "无法读取所选文件：请重新选择 .deb（文件可能已被移动或没有读取权限）",
+                    )
+                } else if (chrootRuntime.hasRoot()) {
                     val ok = chrootRuntime.installDeb(target, progress, log)
                     mapOf("ok" to ok, "name" to displayName)
+                } else {
+                    // Non-root (Termux-style) runtime: dpkg lives in our own prefix and the
+                    // app owns it, so installing works without root. Refusing outright here
+                    // was why "安装 .deb" always failed on unrooted devices.
+                    val (ok, message) = linuxRuntime.installDeb(target, progress, log)
+                    mapOf("ok" to ok, "name" to displayName, "message" to message)
                 }
             } catch (error: Throwable) {
                 Log.e(TAG, "deb install failed", error)

@@ -179,7 +179,13 @@ class DesktopActivity : Activity() {
         fun teardownAndAwait(timeoutMs: Long = 3_000): Boolean {
             val activity = current?.get() ?: return true
             val latch = activity.destroyLatch
-            activity.runOnUiThread { activity.finishAndRemoveTask() }
+            // finish(), not finishAndRemoveTask(): DesktopActivity is started from
+            // MainActivity without FLAG_ACTIVITY_NEW_TASK, so both live in the same
+            // task. finishAndRemoveTask() would also destroy MainActivity — and with
+            // it the Flutter engine that is waiting for restartDesktopForDisplay to
+            // return, which is exactly why a resolution change looked like "the whole
+            // app has to be restarted". finish() only drops the desktop screen.
+            activity.runOnUiThread { activity.finish() }
             return try {
                 latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             } catch (interrupted: InterruptedException) {
@@ -413,7 +419,13 @@ class DesktopActivity : Activity() {
                 pressKey = ::imePressKey,
             ).also { anchor ->
                 placeholder.addView(anchor, FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START))
-                anchor.isFocusableInTouchMode = true
+                // NOT focusable by default. A focusable EditText in the window makes
+                // Android auto-show the IME the moment the window gains focus — that is
+                // exactly the "keyboard pops up at startup" bug. showKeyboard() flips
+                // these flags on right before it calls requestFocus(); hideKeyboard()
+                // clears focus so the anchor leaves the focus chain again.
+                anchor.isFocusable = false
+                anchor.isFocusableInTouchMode = false
                 // Must stay VISIBLE (alpha 0, one pixel): INVISIBLE views cannot hold focus.
                 anchor.visibility = View.VISIBLE
                 anchor.alpha = 0f
@@ -874,6 +886,10 @@ class DesktopActivity : Activity() {
         if (anchor != null) {
             anchor.clearFocus()
             anchor.text?.clear()
+            // Leave the focus chain entirely so nothing can auto-show the IME again until
+            // the guest actually focuses an editable widget.
+            anchor.isFocusable = false
+            anchor.isFocusableInTouchMode = false
         }
         extraKeysBar?.releaseAll()
         extraKeysBar?.visibility = View.GONE
@@ -900,6 +916,12 @@ class DesktopActivity : Activity() {
         if (isImeVisible()) return
         val anchor = imeAnchor ?: lorieView ?: return
         val inputMethod = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        // The anchor is kept unfocusable while the desktop is idle (see setupLorieView) so
+        // that window focus alone can never pop the keyboard; arm it only for this call.
+        if (anchor !== lorieView) {
+            anchor.isFocusable = true
+            anchor.isFocusableInTouchMode = true
+        }
         // Clear + re-request instead of restartInput(): an IME dismissed while the anchor
         // still held focus ignores showSoftInput, but accepts it after a fresh focus cycle.
         anchor.clearFocus()
@@ -909,8 +931,10 @@ class DesktopActivity : Activity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window.insetsController?.show(WindowInsets.Type.ime())
             } else {
+                // SHOW_IMPLICIT, not SHOW_FORCED: FORCED keeps the IME up even after the
+                // anchor loses focus, which made the keyboard stick across screens.
                 @Suppress("DEPRECATION")
-                inputMethod.showSoftInput(anchor, InputMethodManager.SHOW_FORCED)
+                inputMethod.showSoftInput(anchor, InputMethodManager.SHOW_IMPLICIT)
             }
         }
     }

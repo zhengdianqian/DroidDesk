@@ -75,6 +75,15 @@ class LinuxRuntime(private val context: Context) {
     @Volatile private var installLogSink: ((String) -> Unit)? = null
     @Volatile private var packageOperationCancelled = false
 
+    /**
+     * Last real apt/dpkg failure, in Chinese. The store used to collapse every failure
+     * into "<pkg> installation failed", which told the user nothing — "Unable to locate
+     * package" (wrong repository) and "Could not resolve hosts" (network) need different
+     * fixes, so the raw reason is captured here and surfaced by the progress UI.
+     */
+    @Volatile var lastPackageError: String = ""
+        private set
+
     fun setInstallLogSink(sink: ((String) -> Unit)?) {
         installLogSink = sink
     }
@@ -84,6 +93,7 @@ class LinuxRuntime(private val context: Context) {
         // running. Stop that process before accepting a new transaction.
         if (activeCommandProcess?.isAlive == true) interruptCommand()
         packageOperationCancelled = false
+        lastPackageError = ""
         clearStalePackageLocks()
     }
 
@@ -1740,19 +1750,34 @@ class LinuxRuntime(private val context: Context) {
         val aptGet = File(prefixDir, "bin/apt-get")
         if (!aptGet.exists()) return "Unsupported"
         val sources = File(prefixDir, "etc/apt/sources.list")
+        // Reachability decides "NoNetwork". Reporting it from the apt exit code was wrong:
+        // 127 means apt-get is missing and -1 means the run timed out, and both were shown
+        // to the user as "network unreachable" even with a perfectly working connection.
+        val reachable = TERMUX_MIRRORS.filter { mirrorHostReachable(it) }
+        if (reachable.isEmpty()) {
+            onLog(
+                t(
+                    "无法连接到任何 Termux 镜像（DNS 或网络被阻断），已保留原软件源。\n",
+                    "Could not reach any Termux mirror (DNS or network blocked); the original sources were kept.\n",
+                ),
+            )
+            return "NoNetwork"
+        }
         runCatching {
             sources.parentFile?.mkdirs()
             val backup = File(prefixDir, "etc/apt/sources.list.droiddesk-before-mirror")
             if (sources.exists() && !backup.exists()) sources.copyTo(backup, overwrite = false)
         }
         var lastExit = -1
-        for (base in TERMUX_MIRRORS) {
+        var started = false
+        for (base in reachable) {
             runCatching {
                 sources.writeText("# DroidDesk termux mirror\n# droiddesk-store-mirror\ndeb $base stable main\n")
             }.onFailure {
                 DesktopLog.append(context, TAG, "termux mirror write failed: ${it.message}")
                 return "AptFailed"
             }
+            started = true
             onLog(t("已写入 Termux 镜像 $base，正在刷新索引…\n", "Termux mirror $base written; refreshing index...\n"))
             lastExit = runTermuxCommand("DEBIAN_FRONTEND=noninteractive apt-get update -o Dpkg::Use-Pty=0")
             if (lastExit == 0) {
@@ -1760,15 +1785,47 @@ class LinuxRuntime(private val context: Context) {
                 return "Ok"
             }
         }
+        if (!started) return "AptFailed"
         return when (lastExit) {
-            127, -1 -> "NoNetwork"
+            127 -> "Unsupported"
+            -1 -> "AptFailed"
             0 -> "Ok"
             else -> "AptFailed"
         }
     }
 
-    /** Runs a command in the guest shell and returns its exit code (-1 when it cannot start). */
-    private fun runTermuxCommand(command: String): Int {
+    /**
+     * Cheap HTTP reachability probe (3s timeout) used to tell "no network" apart from
+     * "apt failed for some other reason" before any source file is touched.
+     */
+    private fun mirrorHostReachable(baseUrl: String): Boolean = try {
+        val url = java.net.URL(baseUrl)
+        val connection = url.openConnection() as java.net.HttpURLConnection
+        try {
+            connection.connectTimeout = 3_000
+            connection.readTimeout = 3_000
+            connection.instanceFollowRedirects = true
+            connection.requestMethod = "GET"
+            connection.setRequestProperty("Range", "bytes=0-0")
+            connection.setRequestProperty("User-Agent", "DroidDesk")
+            // Any HTTP answer (200/206/301/403…) proves DNS + routing work; only an
+            // IOException means the host is actually unreachable.
+            connection.responseCode in 100..599
+        } finally {
+            connection.disconnect()
+        }
+    } catch (error: Throwable) {
+        DesktopLog.append(context, TAG, "mirror probe $baseUrl failed: ${error.message}")
+        false
+    }
+
+    /**
+     * Runs [command] through the prefix shell. [onLog] receives each non-blank line so
+     * callers that must surface the reason to the UI (deb install, mirror switching) can
+     * forward dpkg/apt diagnostics instead of swallowing them. Returns the exit code,
+     * or -1 when the command could not be started or timed out.
+     */
+    private fun runTermuxCommand(command: String, onLog: ((String) -> Unit)? = null): Int {
         return try {
             val process = ProcessBuilder("${prefixDir.absolutePath}/bin/sh", "-c", command)
                 .directory(homeDir)
@@ -1776,7 +1833,12 @@ class LinuxRuntime(private val context: Context) {
                 .redirectErrorStream(true)
                 .start()
             process.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { line -> if (line.isNotBlank()) Log.i(TAG, "apt: $line") }
+                lines.forEach { line ->
+                    if (line.isNotBlank()) {
+                        Log.i(TAG, "apt: $line")
+                        onLog?.invoke(line)
+                    }
+                }
             }
             if (!process.waitFor(90, java.util.concurrent.TimeUnit.SECONDS)) {
                 process.destroyForcibly()
@@ -2193,20 +2255,72 @@ class LinuxRuntime(private val context: Context) {
                 "timeout --signal=TERM --kill-after=5s 90s dpkg --configure -a",
             )
             val installed = packages.all(::isDpkgPackageInstalled)
-            return installed && !configureOutput.startsWith("Error:") &&
+            val ok = installed && !configureOutput.startsWith("Error:") &&
                 (!installOutput.startsWith("Error:") || installed)
+            if (!ok && !packageOperationCancelled) {
+                lastPackageError = explainPackageFailure(
+                    packages,
+                    listOf(installOutput, configureOutput),
+                )
+            }
+            return ok
         }
 
         if (installAndRecover()) return true
         if (packageOperationCancelled) return false
 
-        onProgress?.invoke(retryProgress, "Refreshing package repositories and retrying...")
+        onProgress?.invoke(retryProgress, t("正在刷新软件源索引并重试…", "Refreshing package indexes and retrying..."))
         // apt may update main/X11 successfully while a third-party repository is
         // temporarily inconsistent. Retrying is still useful with those newly
         // refreshed lists and apt's last verified TUR index.
-        executeCommand("timeout --signal=TERM --kill-after=5s 120s apt-get update")
+        val updateOutput = executeCommand("timeout --signal=TERM --kill-after=5s 120s apt-get update")
         if (packageOperationCancelled) return false
-        return installAndRecover()
+        if (installAndRecover()) return true
+        // "Unable to locate package" after a failed update means the index refresh is the
+        // root cause (DNS/proxy/seccomp), not the package itself — say so instead of
+        // repeating a generic install failure.
+        if (updateOutput.startsWith("Error:")) {
+            lastPackageError = t(
+                "软件源索引刷新失败，无法定位软件包：${aptFailureReason(updateOutput)}",
+                "Package index refresh failed, so the package cannot be located: ${aptFailureReason(updateOutput)}",
+            )
+        }
+        return false
+    }
+
+    /**
+     * Turns raw apt/dpkg output into one short Chinese reason the store can display.
+     * The English originals are kept inside the translation keys so logs stay greppable.
+     */
+    private fun explainPackageFailure(packages: List<String>, outputs: List<String>): String {
+        val joined = outputs.joinToString("\n")
+        val reason = aptFailureReason(joined)
+        val names = packages.joinToString("、")
+        return t("安装 $names 失败：$reason", "Installing $names failed: $reason")
+    }
+
+    private fun aptFailureReason(output: String): String = when {
+        output.contains("Unable to locate package") || output.contains("没有找到与匹配") ->
+            t("当前软件源中没有这个软件包（仓库里不存在该名称）", "the package does not exist in the current repositories")
+        output.contains("Could not resolve") || output.contains("Temporary failure resolving") ||
+            output.contains("Failed to fetch") || output.contains("Connection failed") ->
+            t("无法连接软件源服务器（DNS 或网络异常）", "cannot reach the mirror servers (DNS or network problem)")
+        output.contains("404") -> t("软件源返回 404，索引可能过期，请重试一键换源", "the mirror returned 404; the index is probably stale — re-run mirror switching")
+        output.contains("GPG error") || output.contains("NO_PUBKEY") || output.contains("not signed") ->
+            t("软件源签名校验失败", "repository signature check failed")
+        output.contains("dpkg: dependency problems") || output.contains("依赖关系的问题") ->
+            t("依赖关系未满足，可尝试安装 .deb 后由 apt 自动补齐依赖", "unmet dependencies; let apt fix them after the .deb install")
+        output.contains("held broken") || output.contains("kept back") ->
+            t("有被锁定的软件包阻止了升级", "a held/broken package is blocking the upgrade")
+        output.contains("space") && output.contains("free") ->
+            t("设备存储空间不足", "not enough free storage on the device")
+        output.contains("Exit code") || output.contains("exit code") || output.contains("Error: Package operation cancelled") ->
+            output.lineSequence().lastOrNull { it.isNotBlank() }?.take(160)
+                ?: t("命令执行失败", "the command failed")
+        else -> output.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.isNotBlank() && !it.startsWith("Reading") && !it.startsWith("Building") }
+            ?.take(160) ?: t("未知错误，请查看安装日志", "unknown error; see the install log")
     }
 
     private fun isDpkgPackageInstalled(packageName: String): Boolean {
@@ -2444,6 +2558,84 @@ class LinuxRuntime(private val context: Context) {
         return verified
     }
 
+    /**
+     * Installs a local .deb into the (non-root) Termux-style prefix with dpkg.
+     *
+     * The chroot runtime needs root and used to be the only supported path, so every
+     * non-root user got "deb 安装需要 root" even though dpkg lives in this prefix and the
+     * app owns it. dpkg -i reports its own diagnostics, which are forwarded verbatim so
+     * the UI can show the real reason instead of a generic failure.
+     *
+     * Returns true when dpkg accepted the package; [message] always carries dpkg's tail.
+     */
+    fun installDeb(
+        hostFile: File,
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Pair<Boolean, String> {
+        if (!isBootstrapped()) return false to t("运行时尚未初始化，请先启动 Linux 桌面。", "Runtime not initialised yet; start the Linux desktop first.")
+        val dpkg = File(prefixDir, "bin/dpkg")
+        if (!dpkg.exists()) {
+            return false to t("运行时缺少 dpkg，无法安装 .deb。", "This runtime has no dpkg, so .deb files cannot be installed.")
+        }
+        if (!hostFile.isFile || hostFile.length() == 0L) {
+            return false to t("未找到有效的 .deb 文件，请重新选择。", "The selected .deb file is missing or empty; pick it again.")
+        }
+        // dpkg refuses paths with control characters and needs a name it can read back
+        // inside our own prefix; normalise to a fixed, predictable location.
+        val staged = File(tmpDir, "droiddesk-install.deb")
+        return try {
+            hostFile.copyTo(staged, overwrite = true)
+            staged.setReadable(true, false)
+            onProgress(0.2, t("正在安装 ${hostFile.name}…", "Installing ${hostFile.name}..."))
+            val installOutput = StringBuilder()
+            val install = runTermuxCommand(
+                "dpkg -i --force-confold '${staged.absolutePath}'",
+            ) { chunk ->
+                installOutput.append(chunk)
+                onLog(chunk)
+            }
+            onProgress(0.7, t("正在补齐依赖…", "Fixing dependencies..."))
+            val fixOutput = StringBuilder()
+            // dpkg -i leaves unmet dependencies unresolved; this is not an error by itself.
+            runTermuxCommand("DEBIAN_FRONTEND=noninteractive apt-get -f install -y") { chunk ->
+                fixOutput.append(chunk)
+                onLog(chunk)
+            }
+            onProgress(0.9, t("正在收尾配置…", "Finalising configuration..."))
+            runTermuxCommand("dpkg --configure -a") { chunk ->
+                installOutput.append(chunk)
+                onLog(chunk)
+            }
+            // .desktop files and helper scripts shipped by the package may still carry the
+            // original Termux shebangs, which would break them at launch time.
+            runCatching { patchShebangs(force = true) }
+
+            val detail = (installOutput + fixOutput).toString()
+                .lines().filter { it.isNotBlank() }.takeLast(6).joinToString("\n")
+            val accepted = install == 0
+            val ok = accepted || detail.contains("already the newest version", ignoreCase = true)
+            if (ok) {
+                onProgress(1.0, t("安装完成", "Installation complete"))
+            } else {
+                onProgress(-1.0, t("安装失败", "Installation failed"))
+            }
+            DesktopLog.append(
+                context, TAG,
+                "deb install ${hostFile.name}: exit=$install ok=$ok",
+            )
+            ok to if (detail.isBlank()) {
+                if (ok) t("安装完成", "Installation complete")
+                else t("dpkg 未能安装该包，请查看日志。", "dpkg could not install the package; see the log.")
+            } else detail
+        } catch (error: Throwable) {
+            Log.e(TAG, "deb install failed", error)
+            DesktopLog.append(context, TAG, "deb install failed: ${error.message}")
+            onProgress(-1.0, t("安装失败：{error}", "Install failed: {error}"))
+            false to (error.message ?: t("未知错误", "Unknown error"))
+        }
+    }
+
     // ── Native package store ──
 
     fun searchNativePackages(query: String, limit: Int = 60): List<Map<String, Any>> {
@@ -2488,16 +2680,17 @@ class LinuxRuntime(private val context: Context) {
         onProgress: (Double, String) -> Unit,
     ): Boolean {
         if (!isSafePackageName(packageName)) {
-            onProgress(-1.0, "Invalid package name")
+            onProgress(-1.0, t("软件包名称不合法", "Invalid package name"))
             return false
         }
-        onProgress(0.08, "Repairing interrupted package operations...")
+        lastPackageError = ""
+        onProgress(0.08, t("正在修复未完成的安装事务…", "Repairing interrupted package operations..."))
         installPackageGroup("dpkg --configure -a")
         if (packageOperationCancelled) {
-            onProgress(-1.0, "Installation cancelled")
+            onProgress(-1.0, t("已取消安装", "Installation cancelled"))
             return false
         }
-        onProgress(0.22, "Installing $packageName and dependencies...")
+        onProgress(0.22, t("正在安装 $packageName 及其依赖…", "Installing $packageName and dependencies..."))
         val optionalId = when (packageName) {
             "firefox" -> "firefox"
             "code-oss", "code" -> "code_oss"
@@ -2513,14 +2706,23 @@ class LinuxRuntime(private val context: Context) {
             installOptionalPackages(listOf(packageName), onProgress, 0.5)
         }
         if (packageOperationCancelled) {
-            onProgress(-1.0, "Installation cancelled")
+            onProgress(-1.0, t("已取消安装", "Installation cancelled"))
             return false
         }
         patchShebangs(force = true)
         refreshDesktopMenus()
         val installed = ok && isDpkgPackageInstalled(packageName)
         if (installed) setStorePackageInstalled(packageName, true)
-        onProgress(if (installed) 1.0 else -1.0, if (installed) "$packageName installed" else "$packageName installation failed")
+        // Surface the captured apt reason instead of a bare "installation failed":
+        // "package not in this repository" and "network unreachable" look identical
+        // otherwise, and the user cannot tell which one to act on.
+        val failure = lastPackageError.ifBlank {
+            t("$packageName 安装失败，请查看安装日志。", "$packageName installation failed; see the install log.")
+        }
+        onProgress(
+            if (installed) 1.0 else -1.0,
+            if (installed) t("$packageName 安装成功", "$packageName installed") else failure,
+        )
         return installed
     }
 
@@ -2554,7 +2756,19 @@ class LinuxRuntime(private val context: Context) {
     fun getUpgradablePackages(refresh: Boolean): List<Map<String, Any>> {
         if (!isBootstrapped()) return emptyList()
         if (refresh) {
-            runQuickCommand("timeout --signal=TERM --kill-after=5s 120s apt-get update >/dev/null 2>&1; true")
+            // Do not swallow update failures: `>/dev/null 2>&1; true` made a broken
+            // resolver look like "there are no updates", which is why updating never
+            // found anything after the repository indexes went stale. Keep the output,
+            // record the real reason, and let the updates screen show it.
+            lastPackageError = ""
+            val updateOutput = executeCommand("timeout --signal=TERM --kill-after=5s 120s apt-get update")
+            if (updateOutput.startsWith("Error:")) {
+                lastPackageError = t(
+                    "刷新软件源失败：${aptFailureReason(updateOutput)}",
+                    "Refreshing package sources failed: ${aptFailureReason(updateOutput)}",
+                )
+                DesktopLog.append(context, TAG, "apt-get update failed: ${aptFailureReason(updateOutput)}")
+            }
         }
         val installed = installedPackageRecords().associateBy { it["name"] as String }
         // Lines look like: name/stable 1.2-1 aarch64 [upgradable from: 1.1-1]
@@ -2580,17 +2794,23 @@ class LinuxRuntime(private val context: Context) {
 
     /** Upgrades every package from [getUpgradablePackages]; core packages are never touched. */
     fun upgradeAllPackages(onProgress: (Double, String) -> Unit): Boolean {
-        onProgress(0.06, "Repairing interrupted package operations...")
+        onProgress(0.06, t("正在修复未完成的安装事务…", "Repairing interrupted package operations..."))
         installPackageGroup("dpkg --configure -a")
         if (packageOperationCancelled) return cancelled(onProgress)
-        onProgress(0.14, "Checking for updates...")
+        onProgress(0.14, t("正在检查可用更新…", "Checking for updates..."))
         val packages = getUpgradablePackages(refresh = true).map { it["name"] as String }
         if (packageOperationCancelled) return cancelled(onProgress)
         if (packages.isEmpty()) {
-            onProgress(1.0, "Everything is up to date")
+            // An empty list right after a failed refresh is not "up to date".
+            val reason = lastPackageError
+            if (reason.isNotBlank()) {
+                onProgress(-1.0, reason)
+                return false
+            }
+            onProgress(1.0, t("所有软件已是最新", "Everything is up to date"))
             return true
         }
-        onProgress(0.3, "Updating ${packages.size} package${if (packages.size == 1) "" else "s"}...")
+        onProgress(0.3, t("正在更新 ${packages.size} 个软件包…", "Updating ${packages.size} package(s)..."))
         val output = executeCommand(
             "DEBIAN_FRONTEND=noninteractive apt-get " +
                 "-o Dpkg::Options::=--force-confdef " +
@@ -2598,7 +2818,7 @@ class LinuxRuntime(private val context: Context) {
                 "install --only-upgrade -y ${packages.joinToString(" ")}",
         )
         if (packageOperationCancelled) return cancelled(onProgress)
-        onProgress(0.88, "Finishing up...")
+        onProgress(0.88, t("正在收尾…", "Finishing up..."))
         patchShebangs(force = true)
         executeCommand("timeout --signal=TERM --kill-after=5s 90s dpkg --configure -a")
         refreshDesktopMenus()
@@ -2606,7 +2826,13 @@ class LinuxRuntime(private val context: Context) {
         val ok = !output.startsWith("Error:") && remaining < packages.size
         onProgress(
             if (ok) 1.0 else -1.0,
-            if (!ok) "Update failed" else if (remaining == 0) "All packages updated" else "$remaining package(s) could not be updated",
+            when {
+                !ok -> lastPackageError.ifBlank {
+                    t("更新失败：${aptFailureReason(output)}", "Update failed: ${aptFailureReason(output)}")
+                }
+                remaining == 0 -> t("全部更新完成", "All packages updated")
+                else -> t("有 $remaining 个软件包未能更新", "$remaining package(s) could not be updated")
+            },
         )
         return ok
     }

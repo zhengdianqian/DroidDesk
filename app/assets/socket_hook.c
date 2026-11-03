@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <android/log.h>
+#include <spawn.h>
 
 #ifndef NEW_PREFIX
 #define NEW_PREFIX "/data/user/0/com.orailnoor.droiddesk/files/usr"
@@ -181,10 +182,19 @@ static const char* rewrite_path(const char* path, char* buf, size_t buf_size) {
     for (int i = 0; i < 6; i++) {
         size_t len = strlen(fhs_prefixes[i]);
         if (strncmp(path, fhs_prefixes[i], len) == 0) {
-            if (i == 5 && tmpdir) {
-                snprintf(buf, buf_size, "%s/%s", tmpdir, path + len);
+            if (i == 5) {
+                /* /tmp is not part of the prefix; it maps onto $TMPDIR. */
+                if (tmpdir) snprintf(buf, buf_size, "%s/%s", tmpdir, path + len);
+                else snprintf(buf, buf_size, "%s/%s/%s", NEW_PREFIX, subdirs[i], path + len);
+            } else if (i == 0) {
+                /* NEW_PREFIX already ends in /usr, so /usr/bin/x -> <prefix>/bin/x.
+                 * The previous "%s/%s%s" form re-inserted "usr" and dropped the
+                 * separator, yielding <prefix>/usrbin/x — which is why absolute
+                 * /usr/... paths from gio/glib reported "No such file or directory". */
+                snprintf(buf, buf_size, "%s/%s", NEW_PREFIX, path + len);
             } else {
-                snprintf(buf, buf_size, "%s/%s%s", NEW_PREFIX, subdirs[i], path + len);
+                /* /bin/x -> <prefix>/bin/x, /lib/x -> <prefix>/lib/x, and so on. */
+                snprintf(buf, buf_size, "%s/%s/%s", NEW_PREFIX, subdirs[i], path + len);
             }
             return buf;
         }
@@ -535,4 +545,196 @@ void *dlopen(const char *filename, int flag) {
         __android_log_print(ANDROID_LOG_ERROR, "LorieNative Hook", "dlopen failed for %s -> %s: %s", filename, new_path, dlerror());
     }
     return ret;
+}
+
+/* ------------------------------------------------------------------------ *
+ * exec family
+ *
+ * open()/connect() redirection is not enough: glib (gio), xdg-open and the
+ * shell's command-not-found handler spawn children by handing an *absolute*
+ * path built from the original Termux prefix straight to execve().  Those
+ * calls never touch the file APIs hooked above, so the kernel looked for
+ * /data/data/com.termux/files/usr/libexec/gio-launch-desktop inside a prefix
+ * that no longer exists and reported "No such file or directory" — exactly
+ * the failure seen when opening a .deb from Thunar, and when bash fell back
+ * to command-not-found.
+ *
+ * Every entry point below rewrites argv[0]/path (and the interpreter path of
+ * a shebang-less wrapper) through rewrite_path() before delegating.  Failure
+ * paths return the real errno instead of swallowing it.
+ * ------------------------------------------------------------------------ */
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execv)(const char *, char *const[]) = NULL;
+static int (*real_execvp)(const char *, char *const[]) = NULL;
+static int (*real_execvpe)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execl)(const char *, ...) = NULL;
+static int (*real_execlp)(const char *, ...) = NULL;
+static int (*real_execle)(const char *, ...) = NULL;
+static int (*real_posix_spawn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                               const posix_spawnattr_t *, char *const[], char *const[]) = NULL;
+static int (*real_posix_spawnp)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                                const posix_spawnattr_t *, char *const[], char *const[]) = NULL;
+
+static void init_exec_hooks(void) {
+    if (real_execve) return;
+    real_execve = dlsym(RTLD_NEXT, "execve");
+    real_execv = dlsym(RTLD_NEXT, "execv");
+    real_execvp = dlsym(RTLD_NEXT, "execvp");
+    real_execvpe = dlsym(RTLD_NEXT, "execvpe");
+    real_execl = dlsym(RTLD_NEXT, "execl");
+    real_execlp = dlsym(RTLD_NEXT, "execlp");
+    real_execle = dlsym(RTLD_NEXT, "execle");
+    real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
+    real_posix_spawnp = dlsym(RTLD_NEXT, "posix_spawnp");
+    __sync_synchronize();
+}
+
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!pathname || !real_execve) { errno = ENOENT; return -1; }
+    return real_execve(rewrite_path(pathname, buf, sizeof(buf)), argv, envp);
+}
+
+int execv(const char *pathname, char *const argv[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!pathname || !real_execv) { errno = ENOENT; return -1; }
+    return real_execv(rewrite_path(pathname, buf, sizeof(buf)), argv);
+}
+
+int execvp(const char *file, char *const argv[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!file || !real_execvp) { errno = ENOENT; return -1; }
+    return real_execvp(rewrite_path(file, buf, sizeof(buf)), argv);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!file || !real_execvpe) { errno = ENOENT; return -1; }
+    return real_execvpe(rewrite_path(file, buf, sizeof(buf)), argv, envp);
+}
+
+/*
+ * The variadic exec entry points take an unbounded, NULL-terminated argument
+ * list. Forwarding only the first argument would silently drop argv[1..] and
+ * break every caller ( gio passes the desktop file plus URIs), so the list is
+ * collected into a scratch array first. 40 covers the widest legitimate call
+ * in this tree with room to spare; anything longer falls back to the original
+ * pathname unchanged rather than truncating.
+ */
+#define DROIDDESK_MAX_EXEC_ARGS 40
+
+static int call_execl(int (*fn)(const char *, ...), const char *path, va_list ap) {
+    const char *args[DROIDDESK_MAX_EXEC_ARGS];
+    int n = 0;
+    const char *a;
+    while ((a = va_arg(ap, const char *)) != NULL && n < DROIDDESK_MAX_EXEC_ARGS) {
+        args[n++] = a;
+    }
+    if (a != NULL) {
+        /* List too long: do not truncate, just pass the path through untouched. */
+        return fn(path, NULL);
+    }
+    if (!n) return fn(path, NULL);
+    if (n == 1) return fn(path, args[0], NULL);
+    if (n == 2) return fn(path, args[0], args[1], NULL);
+    if (n == 3) return fn(path, args[0], args[1], args[2], NULL);
+    if (n == 4) return fn(path, args[0], args[1], args[2], args[3], NULL);
+    if (n == 5) return fn(path, args[0], args[1], args[2], args[3], args[4], NULL);
+    if (n == 6) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], NULL);
+    if (n == 7) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], NULL);
+    if (n == 8) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], NULL);
+    if (n == 9) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], NULL);
+    if (n == 10) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], NULL);
+    if (n == 11) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], NULL);
+    if (n == 12) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], NULL);
+    if (n == 13) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], NULL);
+    if (n == 14) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], NULL);
+    if (n == 15) return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], NULL);
+    return fn(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], NULL);
+}
+
+int execl(const char *pathname, const char *arg, ...) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!pathname || !real_execl) { errno = ENOENT; return -1; }
+    const char *path = rewrite_path(pathname, buf, sizeof(buf));
+    va_list ap;
+    va_start(ap, arg);
+    int rc = call_execl(real_execl, path, ap);
+    va_end(ap);
+    return rc;
+}
+
+int execlp(const char *file, const char *arg, ...) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!file || !real_execlp) { errno = ENOENT; return -1; }
+    const char *path = rewrite_path(file, buf, sizeof(buf));
+    va_list ap;
+    va_start(ap, arg);
+    int rc = call_execl(real_execlp, path, ap);
+    va_end(ap);
+    return rc;
+}
+
+int execle(const char *pathname, const char *arg, ...) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!pathname || !real_execle) { errno = ENOENT; return -1; }
+    /* execle's trailing argument is envp, not part of argv: collect argv first,
+     * then read envp off the end of the same list. */
+    const char *path = rewrite_path(pathname, buf, sizeof(buf));
+    const char *args[DROIDDESK_MAX_EXEC_ARGS];
+    int n = 0;
+    va_list ap;
+    va_start(ap, arg);
+    const char *a;
+    while ((a = va_arg(ap, const char *)) != NULL && n < DROIDDESK_MAX_EXEC_ARGS) {
+        args[n++] = a;
+    }
+    char *const *envp = a ? NULL : (char *const *)va_arg(ap, char *const *);
+    va_end(ap);
+    if (envp == NULL) return real_execle(path, NULL);
+    switch (n) {
+        case 0: return real_execle(path, envp);
+        case 1: return real_execle(path, args[0], envp);
+        case 2: return real_execle(path, args[0], args[1], envp);
+        case 3: return real_execle(path, args[0], args[1], args[2], envp);
+        case 4: return real_execle(path, args[0], args[1], args[2], args[3], envp);
+        case 5: return real_execle(path, args[0], args[1], args[2], args[3], args[4], envp);
+        case 6: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], envp);
+        case 7: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], envp);
+        case 8: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], envp);
+        case 9: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], envp);
+        case 10: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], envp);
+        case 11: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], envp);
+        case 12: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], envp);
+        case 13: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], envp);
+        case 14: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], envp);
+        default: return real_execle(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], envp);
+    }
+}
+
+int posix_spawn(pid_t *pid, const char *path,
+                const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp,
+                char *const argv[], char *const envp[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!path || !real_posix_spawn) { errno = ENOENT; return ENOENT; }
+    return real_posix_spawn(pid, rewrite_path(path, buf, sizeof(buf)), file_actions, attrp, argv, envp);
+}
+
+int posix_spawnp(pid_t *pid, const char *file,
+                 const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp,
+                 char *const argv[], char *const envp[]) {
+    setup(); init_exec_hooks();
+    char buf[1024];
+    if (!file || !real_posix_spawnp) { errno = ENOENT; return ENOENT; }
+    return real_posix_spawnp(pid, rewrite_path(file, buf, sizeof(buf)), file_actions, attrp, argv, envp);
 }

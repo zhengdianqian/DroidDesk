@@ -41,6 +41,17 @@ jobs:
           flutter --version
           java -version
 
+      # build.gradle.kts declares externalNativeBuild.cmake version 3.22.1 and
+      # ndkVersion = flutter.ndkVersion (Flutter 3.47.9 -> 28.2.13676358); make sure
+      # both are present so Gradle does not have to fetch them mid-build.
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;28.2.13676358" "cmake;3.22.1"
+
       - name: Install Flutter dependencies
         run: flutter pub get
 
@@ -49,13 +60,26 @@ jobs:
           set -o pipefail
           flutter build apk --release 2>&1 | tee /tmp/build.log
 
+      # Rename the APK with the version from app/pubspec.yaml (e.g. 2.0.0+200 ->
+      # DroidDesk-v2.0.0-arm64.apk; abiFilters already restricts it to arm64-v8a).
+      - name: Name APK with app version
+        id: versioned
+        working-directory: .
+        run: |
+          VERSION=$(sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' app/pubspec.yaml | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::cannot read version from app/pubspec.yaml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cp app/build/app/outputs/flutter-apk/app-release.apk "DroidDesk-v${VERSION}-arm64.apk"
+          ls -l DroidDesk-v*.apk
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: droiddesk-release-apk
-          path: |
-            build/app/outputs/flutter-apk/*.apk
-            app/build/app/outputs/flutter-apk/*.apk
+          name: DroidDesk-v${{ steps.versioned.outputs.version }}-arm64.apk
+          path: DroidDesk-v*.apk
           if-no-files-found: error
 
       - name: Prepare release asset

@@ -62,11 +62,20 @@
         </activity>
 
         <!-- Native Desktop Activity -->
+        <!--
+          windowSoftInputMode="stateHidden|adjustNothing": the guest desktop must never pop
+          the Android IME just because the window gained focus or LorieView/imeAnchor became
+          focusable at startup. The IME is shown explicitly by DesktopActivity.showKeyboard(),
+          which is only called when the guest actually focuses an editable widget (see
+          startAutoImePolling / armImeFromTap). adjustNothing also keeps the X surface from
+          being resized when the keyboard does appear.
+        -->
         <activity
             android:name=".view.DesktopActivity"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
             android:launchMode="singleTop"
             android:taskAffinity=""
+            android:windowSoftInputMode="stateHidden|adjustNothing"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
 
         <!-- The native X server must have a different Linux process and FD table than LorieView. -->
