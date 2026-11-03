@@ -3360,7 +3360,7 @@ DROIDDESK_X11
                     sleep 0.5
                 done
                 if [ "${'$'}i" -lt 80 ]; then
-                    printf '1\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                    printf '1\n' > "${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}/wm-ok" 2>/dev/null || true
                     echo "DIAG: xfwm4 alive"
                 else
                     echo "DIAG: xfwm4 not alive after 40s, restarting once"
@@ -3369,10 +3369,10 @@ DROIDDESK_X11
                     ) &
                     sleep 3
                     if wm_alive; then
-                        printf '1\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                        printf '1\n' > "${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}/wm-ok" 2>/dev/null || true
                         echo "DIAG: xfwm4 recovered"
                     else
-                        printf '0\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                        printf '0\n' > "${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}/wm-ok" 2>/dev/null || true
                         echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
                     fi
                 fi
