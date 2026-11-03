@@ -1430,6 +1430,37 @@ class HomeScreen extends StatelessWidget {
                                       color: DroidTheme.textSecondary,
                                     ),
                                   ),
+                                if ((step['detail']?.toString() ?? '').isNotEmpty)
+                                  Text(
+                                    step['detail'].toString(),
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      color: DroidTheme.textSecondary,
+                                    ),
+                                  ),
+                                if ((step['log']?.toString() ?? '').isNotEmpty)
+                                  ExpansionTile(
+                                    tilePadding: EdgeInsets.zero,
+                                    childrenPadding: const EdgeInsets.only(
+                                      bottom: 6,
+                                    ),
+                                    dense: true,
+                                    title: Text(
+                                      AppStrings.t(
+                                        'settings.preinstall.details',
+                                      ),
+                                      style: const TextStyle(fontSize: 11),
+                                    ),
+                                    children: [
+                                      SelectableText(
+                                        step['log'].toString(),
+                                        style: const TextStyle(
+                                          fontSize: 10,
+                                          fontFamily: 'monospace',
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                               ],
                             ),
                           ),
@@ -1444,6 +1475,37 @@ class HomeScreen extends StatelessWidget {
               ),
             ),
             actions: [
+              TextButton(
+                onPressed: () async {
+                  final text = await state.loadDesktopDiagnostics();
+                  if (!dialogContext.mounted) return;
+                  showDialog<void>(
+                    context: dialogContext,
+                    builder: (diagContext) => AlertDialog(
+                      title: Text(AppStrings.t('settings.diagnostics.title')),
+                      content: SizedBox(
+                        width: 520,
+                        child: SingleChildScrollView(
+                          child: SelectableText(
+                            text,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ),
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(diagContext),
+                          child: Text(AppStrings.t('common.close')),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+                child: Text(AppStrings.t('settings.diagnostics.title')),
+              ),
               TextButton(
                 onPressed: () => Navigator.pop(dialogContext),
                 child: Text(AppStrings.t('common.close')),

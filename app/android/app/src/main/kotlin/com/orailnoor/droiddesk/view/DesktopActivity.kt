@@ -977,7 +977,7 @@ class DesktopActivity : Activity() {
                     // Best effort: Android app integration must never block the desktop.
                     runPhase("接入 Android 应用", 30_000) {
                         runCatching {
-                            val rootfsPath = chrootRuntime.getRootfsPath()
+                            val rootfsPath = chrootRuntime.rootfsPath
                             chrootRuntime.executeCommand(
                                 "mkdir -p /tmp && mkfifo /tmp/android_intent_pipe && chmod 666 /tmp/android_intent_pipe",
                             ) {}

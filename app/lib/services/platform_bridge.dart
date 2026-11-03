@@ -470,6 +470,13 @@ class DroidDeskPlatform {
     return _map(result);
   }
 
+  /// Snapshot proving what xfce actually loaded (locale/panel/icon theme/browser).
+  static Future<String> getDesktopDiagnostics() async {
+    final result = await _channel.invokeMethod('getDesktopDiagnostics');
+    final map = _map(result);
+    return map['text']?.toString() ?? '';
+  }
+
   static Map<String, dynamic> _map(dynamic value) =>
       value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
 

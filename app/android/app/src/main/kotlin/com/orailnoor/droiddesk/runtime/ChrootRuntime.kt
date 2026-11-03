@@ -37,6 +37,9 @@ class ChrootRuntime(private val context: Context) {
 
     private val baseDir: File get() = context.filesDir
     private val rootfsDir: File get() = File(baseDir, "rootfs")
+
+    /** Absolute rootfs path, used by the app to verify sockets and processes. */
+    val rootfsPath: String get() = rootfsDir.absolutePath
     private val tmpDir: File get() = File(baseDir, "tmp")
     private val x11HostDir: File get() = File(tmpDir, ".X11-unix")
 
@@ -52,8 +55,6 @@ class ChrootRuntime(private val context: Context) {
     }
 
     fun isRunning(): Boolean = sessionProcess?.isAlive == true
-
-    fun getRootfsPath(): String = rootfsDir.absolutePath
 
     fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
 
@@ -147,12 +148,19 @@ class ChrootRuntime(private val context: Context) {
                 export NO_AT_BRIDGE=1
                 export GTK_A11Y=none
 
-                # Locale — Chinese by default, with an English C.UTF-8 fallback for
-                # tools that reject a not-yet-generated locale during first boot.
-                export LANG=zh_CN.UTF-8
-                export LANGUAGE=zh_CN:zh
-                export LC_ALL=zh_CN.UTF-8
-                export LC_CTYPE=zh_CN.UTF-8
+                # Locale — Chinese only when the locale data really exists. v2.0.0 exported
+                # LANG=zh_CN.UTF-8 unconditionally; on a rootfs whose "locales" package
+                # never configured, gettext falls back to C and every app stayed English.
+                if locale -a 2>/dev/null | grep -qi '^zh_CN'; then
+                  export LANG=zh_CN.UTF-8
+                  export LANGUAGE=zh_CN:zh
+                  export LC_ALL=zh_CN.UTF-8
+                  export LC_CTYPE=zh_CN.UTF-8
+                else
+                  export LANG=C.UTF-8
+                  export LC_ALL=C.UTF-8
+                  export LANGUAGE=zh_CN:zh
+                fi
 
                 # Input method bridge (IBus) so GTK/Qt apps can type Chinese
                 export GTK_IM_MODULE=ibus
@@ -426,6 +434,11 @@ class ChrootRuntime(private val context: Context) {
         }
 
         onPhase("应用桌面配置")
+        // XFCE translations only work when the zh_CN.UTF-8 locale data exists. Checking (and
+        // generating) it before xfce starts is what actually makes the UI Chinese; exporting
+        // LANG alone does not when "locales" was never configured by dpkg.
+        runCatching { ensureSessionLocale() }
+            .onFailure { Log.w(TAG, "Locale check failed", it) }
 
         // The profile is staged in app storage (see installChrootXfceMobileProfile), so its
         // version marker lives there rather than in the root-owned chroot home.
@@ -509,9 +522,9 @@ class ChrootRuntime(private val context: Context) {
             export TMPDIR=/tmp
             export HOME=/root
             export PREFIX=/usr
-            export LANG=zh_CN.UTF-8
-            export LC_ALL=zh_CN.UTF-8
-            export LANGUAGE=zh_CN:zh
+            # LANG/LC_ALL are decided in /etc/profile.d/droiddesk-ha.sh from `locale -a`:
+            # exporting zh_CN.UTF-8 here unconditionally is what kept the UI English on a
+            # rootfs without generated locale data.
             # This is a normal Ubuntu userspace, not the relocated native
             # Termux runtime.  Load only the glibc compatibility shim built
             # for this rooted Ubuntu filesystem.
@@ -694,6 +707,9 @@ SESSEOF
             // wallpaper must not turn into a 45 s "starting" screen on every launch.
             if (required.all { it in names } && (alternatives.isEmpty() || alternatives.any { it in names })) {
                 Thread.sleep(650)
+                // One snapshot per session start, so settings can prove which locale and
+                // panel position xfce really loaded. No timer, no polling loop.
+                captureSessionDiagnostics()
                 return true
             }
             Thread.sleep(400)
@@ -740,6 +756,11 @@ SESSEOF
             cp -f ${shellQuote(stagingWallpaper.absolutePath)} ${shellQuote(chrootWallpaper.absolutePath)}
             chmod 0644 ${shellQuote(chrootWallpaper.absolutePath)}
             cp -R ${shellQuote(File(stagingHome, ".config").absolutePath)} ${shellQuote(chrootHome.absolutePath)}
+            if [ -d ${shellQuote(File(stagingHome, ".local").absolutePath)} ]; then
+              mkdir -p ${shellQuote(File(chrootHome, ".local").absolutePath)}
+              cp -R ${shellQuote(File(stagingHome, ".local").absolutePath)}/. ${shellQuote(File(chrootHome, ".local").absolutePath)}/
+              chown -R 0:0 ${shellQuote(File(chrootHome, ".local").absolutePath)}
+            fi
             chown -R 0:0 ${shellQuote(File(chrootHome, ".config").absolutePath)}
         """.trimIndent()
 
@@ -817,26 +838,74 @@ SESSEOF
      * existing install picks Yaru up as soon as the package arrives.
      */
     private fun chrootIconTheme(): String =
-        if (File(rootfsDir, "usr/share/icons/Yaru").isDirectory) "Yaru" else "Papirus"
+        // An IconThemeName that does not exist on disk silently degrades to hicolor, which
+        // is exactly the "icons are still the old generic ones" report. Only advertise a
+        // theme that is really installed; Adwaita ships with every GTK install.
+        listOf("Yaru", "Papirus-Dark", "Papirus", "Adwaita")
+            .firstOrNull { File(rootfsDir, "usr/share/icons/$it").isDirectory }
+            ?: "Adwaita"
 
     /**
      * Stop the chroot session and unmount bind mounts.
      */
     fun stopSession() {
         Log.i(TAG, "Stopping chroot session...")
+        val residual = forceStopSession()
+        DesktopLog.append(
+            context,
+            TAG,
+            "chroot session stopped by user (residual pids=${residual.joinToString(",")})",
+        )
+        Log.i(TAG, "Chroot session stopped, residual pids=$residual")
+    }
+
+    /**
+     * Stops the session and then *proves* it stopped: every process whose command line still
+     * references this rootfs is killed with SIGKILL, and the survivors are returned.
+     * v2.0.0 trusted sessionProcess.isAlive, which is null after a process hand-off, so the
+     * UI reported "stopped" while the desktop kept running.
+     */
+    fun forceStopSession(): List<Int> {
         sessionProcess?.let {
-            try {
+            runCatching {
                 it.destroyForcibly()
                 it.waitFor()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error stopping session: ${e.message}")
-            }
+            }.onFailure { error -> Log.w(TAG, "destroyForcibly failed: ${error.message}") }
         }
         sessionProcess = null
+
+        var residual = listPidsContainingRootfs()
+        if (residual.isNotEmpty()) {
+            runCatching { rootShell.exec("kill -9 ${residual.joinToString(" ")} 2>/dev/null; true") }
+            Thread.sleep(350)
+            residual = listPidsContainingRootfs()
+        }
+        if (residual.isNotEmpty()) {
+            runCatching {
+                rootShell.exec("pkill -9 -f ${shellQuote(rootfsDir.absolutePath)} 2>/dev/null; true")
+            }
+            Thread.sleep(350)
+            residual = listPidsContainingRootfs()
+        }
+
         DesktopSessionState.markStopped()
-        DesktopLog.append(context, TAG, "chroot session stopped by user")
         unmountAll()
-        Log.i(TAG, "Chroot session stopped")
+        return residual
+    }
+
+    /** Pids (as root) whose /proc cmdline still points at this chroot's rootfs. */
+    fun listPidsContainingRootfs(): List<Int> {
+        if (!hasRoot()) return emptyList()
+        val marker = rootfsDir.absolutePath
+        val script = "for p in /proc/[0-9]*; do " +
+            "c=\$(tr '\\0' ' ' < \$p/cmdline 2>/dev/null); " +
+            "case \"\$c\" in *\"$marker\"*) echo \${p#/proc/};; esac; done"
+        val output = runCatching { rootShell.exec(script) }.getOrDefault("")
+        return output.lineSequence()
+            .mapNotNull { it.trim().toIntOrNull() }
+            .filter { it > 1 }
+            .distinct()
+            .toList()
     }
 
     // ── Mount handling ──
@@ -979,6 +1048,106 @@ SESSEOF
             Log.i(TAG, "Stale chroot session cleaned")
         }.onFailure { Log.w(TAG, "Stale chroot cleanup failed: ${it.message}") }
     }
+
+    /**
+     * Verifies that zh_CN.UTF-8 really exists in the guest and generates it when it does
+     * not. Returns true only when `locale -a` lists it, so the caller can report honestly.
+     */
+    fun ensureSessionLocale(): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        val check = "locale -a 2>/dev/null | grep -qi 'zh_CN'"
+        if (execChroot(check) == 0) {
+            writeLocaleFiles(chinese = true)
+            return true
+        }
+
+        // "locales" is frequently the package whose postinst fails under proot/chroot
+        // (alongside dictionaries-common). Repair dpkg first, then generate explicitly;
+        // locale-gen works even when only the unpack half of the package succeeded.
+        execChroot(
+            "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends locales 2>&1 | tail -n 12",
+        )
+        execChroot(
+            "DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tail -n 8; " +
+                "DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 | tail -n 8",
+        )
+        execChroot("locale-gen zh_CN.UTF-8 2>&1 | tail -n 5")
+
+        val ready = execChroot(check) == 0
+        writeLocaleFiles(chinese = ready)
+        DesktopLog.append(
+            context,
+            TAG,
+            "ensureSessionLocale: zh_CN.UTF-8 available=$ready",
+        )
+        return ready
+    }
+
+    /** Writes every locale file the session reads; honest fallback when generation failed. */
+    private fun writeLocaleFiles(chinese: Boolean) {
+        val lang = if (chinese) "zh_CN.UTF-8" else "C.UTF-8"
+        val lcAll = if (chinese) "zh_CN.UTF-8" else "C.UTF-8"
+        val language = if (chinese) "zh_CN:zh" else "C"
+        execChroot(
+            "mkdir -p /root /etc; " +
+                "printf '%s\\n' 'LANG=$lang' 'LANGUAGE=$language' 'LC_ALL=$lcAll' > /etc/default/locale; " +
+                "printf '%s\\n' 'LANG=$lang' 'LANGUAGE=$language' 'LC_ALL=$lcAll' > /etc/environment; " +
+                "printf '%s\\n' '[Desktop]' 'Language=$lang' > /root/.dmrc; " +
+                "printf '%s\\n' 'export LANG=$lang' 'export LC_ALL=$lcAll' 'export LANGUAGE=$language' > /root/.xprofile; " +
+                "mkdir -p /root/.config; printf '%s\\n' '$lang' > /root/.config/user-dirs.locale",
+        )
+    }
+
+    /**
+     * Snapshot of the settings that users cannot check from inside the desktop: the profile
+     * marker that was written, the locale the panel process really inherited, the panel
+     * position xfce actually loaded, the icon theme on disk and the installed browser.
+     * Written once per session start (no polling) and read on demand by settings.
+     */
+    fun captureSessionDiagnostics() {
+        val script = """
+            D=/tmp/droiddesk-diagnostics.txt
+            {
+              echo "== profile =="
+              cat /root/.droiddesk-xfce-mobile-* 2>/dev/null
+              echo "== locale =="
+              locale 2>&1 | head -n 5
+              locale -a 2>/dev/null | grep -i zh_CN || echo "zh_CN locale: MISSING"
+              echo "== panel =="
+              PANEL_PID=${'$'}(pgrep -n xfce4-panel 2>/dev/null)
+              if [ -n "${'$'}PANEL_PID" ]; then
+                tr '\0' '\n' < /proc/${'$'}PANEL_PID/environ 2>/dev/null | grep -E '^(LANG|LC_ALL|LANGUAGE|DISPLAY)=' || true
+              else
+                echo "xfce4-panel not running"
+              fi
+              xfconf-query -c xfce4-panel -p /panels/panel-2/position 2>&1 || echo "position query failed"
+              xfconf-query -c xfce4-panel -p /panels/panel-2/mode 2>&1 || true
+              xfconf-query -c xsettings -p /Net/IconThemeName 2>&1 || true
+              echo "== icons =="
+              ls /usr/share/icons 2>/dev/null | tr '\n' ' '; echo
+              ls /root/.local/share/icons/hicolor/scalable/apps 2>/dev/null | tr '\n' ' '; echo
+              echo "== browser =="
+              for b in google-chrome google-chrome-stable chromium epiphany firefox; do
+                if command -v ${'$'}b >/dev/null 2>&1; then
+                  echo "${'$'}b: ${'$'}(${'$'}b --version 2>&1 | head -n 1)"
+                fi
+              done
+              echo "== store =="
+              ls -l /usr/local/bin/droiddesk-store /usr/local/bin/droiddesk-browser 2>&1
+            } > ${'$'}D 2>&1
+            chmod 644 ${'$'}D
+        """.trimIndent()
+        runCatching { execChroot(script) }
+            .onFailure { Log.w(TAG, "Diagnostics capture failed", it) }
+    }
+
+    /** Reads the diagnostics snapshot written by [captureSessionDiagnostics]. */
+    fun readDiagnostics(): String = runCatching {
+        rootShell.exec(
+            "cat ${shellQuote(File(rootfsDir, "tmp/droiddesk-diagnostics.txt").absolutePath)} " +
+                "2>/dev/null || echo '尚无快照：请先启动一次桌面'",
+        )
+    }.getOrDefault("诊断读取失败")
 
     /**
      * Applies the Chinese desktop defaults to an *already installed* rootfs.
@@ -1149,6 +1318,41 @@ SESSEOF
             repair.writeText(aptRepairScript())
             repair.setExecutable(true, false)
 
+            // Browser dispatcher: opens whichever browser the preinstall step managed to
+            // install. Chrome/Chromium need --no-sandbox because the session runs as root.
+            val browserHelper = File(staging, "droiddesk-browser")
+            browserHelper.writeText(browserDispatcherScript())
+            browserHelper.setExecutable(true, false)
+
+            // QQ/WeChat helpers: native arm64 client when present, official web client
+            // otherwise. The vendor Linux clients did not exist for arm64 in older builds,
+            // but both are published now, so this is a real chain and not a stub.
+            val qqHelper = File(staging, "droiddesk-qq")
+            qqHelper.writeText(nativeOrWebScript(listOf("/opt/QQ/qq", "/usr/bin/qq"), "https://web.qq.com"))
+            qqHelper.setExecutable(true, false)
+
+            val wechatHelper = File(staging, "droiddesk-wechat")
+            wechatHelper.writeText(
+                nativeOrWebScript(
+                    listOf("/usr/bin/wechat", "/opt/wechat/wechat", "/opt/wechat/wechat-bin"),
+                    "https://wx.qq.com",
+                ),
+            )
+            wechatHelper.setExecutable(true, false)
+
+            // Bundle the dock icons with the APK: they must survive without any theme
+            // package or network access (the "icons are still the old generic ones" report).
+            val iconDir = File(staging, "icons").apply { mkdirs() }
+            runCatching {
+                context.assets.list("droiddesk/icons").orEmpty()
+                    .filter { it.endsWith(".svg") }
+                    .forEach { name ->
+                        context.assets.open("droiddesk/icons/$name").use { input ->
+                            File(iconDir, name).outputStream().use(input::copyTo)
+                        }
+                    }
+            }.onFailure { Log.w(TAG, "Bundled icons unavailable: ${it.message}") }
+
             val storeDesktop = File(staging, "droiddesk-store.desktop")
             storeDesktop.writeText(desktopEntry(
                 // Ubuntu's own GNOME Software is snap-based and cannot run in proot, so this
@@ -1156,7 +1360,7 @@ SESSEOF
                 name = "Ubuntu 软件 / Ubuntu Software",
                 comment = "搜索并安装 apt 软件包，安装本地 .deb",
                 exec = "/usr/local/bin/droiddesk-store",
-                icon = "system-software-install",
+                icon = "droiddesk-store",
                 categories = "System;PackageManager;",
             ))
             val debDesktop = File(staging, "droiddesk-deb.desktop")
@@ -1183,13 +1387,21 @@ SESSEOF
                 install -m 0755 ${shellQuote(deb.absolutePath)} /usr/local/bin/droiddesk-install-deb
                 install -m 0755 ${shellQuote(ime.absolutePath)} /usr/local/bin/droiddesk-ime-watch
                 install -m 0755 ${shellQuote(repair.absolutePath)} /usr/local/bin/droiddesk-apt-repair
+                install -m 0755 ${shellQuote(browserHelper.absolutePath)} /usr/local/bin/droiddesk-browser
+                install -m 0755 ${shellQuote(qqHelper.absolutePath)} /usr/local/bin/droiddesk-qq
+                install -m 0755 ${shellQuote(wechatHelper.absolutePath)} /usr/local/bin/droiddesk-wechat
+                install -d -m 0755 /root/.local/share/icons/hicolor/scalable/apps
+                if ls ${shellQuote(iconDir.absolutePath)}/*.svg >/dev/null 2>&1; then
+                  cp -f ${shellQuote(iconDir.absolutePath)}/*.svg /root/.local/share/icons/hicolor/scalable/apps/
+                fi
+                gtk-update-icon-cache -f -t /root/.local/share/icons/hicolor >/dev/null 2>&1 || true
                 install -m 0644 ${shellQuote(storeDesktop.absolutePath)} /usr/share/applications/droiddesk-store.desktop
                 install -m 0644 ${shellQuote(debDesktop.absolutePath)} /usr/share/applications/droiddesk-deb.desktop
                 install -m 0755 ${shellQuote(storeDesktop.absolutePath)} /root/Desktop/droiddesk-store.desktop
                 install -m 0644 ${shellQuote(mimeApps.absolutePath)} /root/.config/mimeapps.list
                 cp -f ${shellQuote(mimeApps.absolutePath)} /etc/xdg/mimeapps.list 2>/dev/null || true
                 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
-                chown -R 0:0 /usr/local/bin/droiddesk-store /usr/local/bin/droiddesk-install-deb /usr/local/bin/droiddesk-ime-watch /usr/local/bin/droiddesk-apt-repair /root/Desktop /root/.config/mimeapps.list
+                chown -R 0:0 /usr/local/bin/droiddesk-store /usr/local/bin/droiddesk-install-deb /usr/local/bin/droiddesk-ime-watch /usr/local/bin/droiddesk-apt-repair /usr/local/bin/droiddesk-browser /usr/local/bin/droiddesk-qq /usr/local/bin/droiddesk-wechat /root/Desktop /root/.config/mimeapps.list /root/.local/share/icons
             """.trimIndent()
             rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(commands)}")
             true
@@ -1198,6 +1410,30 @@ SESSEOF
             DesktopLog.append(context, TAG, "guest scripts failed: ${error.message}")
             false
         }
+    }
+
+    private fun browserDispatcherScript(): String = """
+        #!/bin/bash
+        # Picks the browser that actually exists. Chrome/Chromium are Chromium-family and
+        # need --no-sandbox inside a root-owned proot/chroot session.
+        for b in google-chrome google-chrome-stable chromium chromium-browser epiphany firefox; do
+          command -v "${'$'}b" >/dev/null 2>&1 || continue
+          case "${'$'}b" in
+            *chrome*|chromium*) exec "${'$'}b" --no-sandbox --disable-dev-shm-usage "${'$'}@" ;;
+            *) exec "${'$'}b" "${'$'}@" ;;
+          esac
+        done
+        exec xdg-open "${'$'}@" 2>/dev/null || true
+    """.trimIndent()
+
+    /** Native client when installed, official web client otherwise. */
+    private fun nativeOrWebScript(nativePaths: List<String>, webUrl: String): String = buildString {
+        appendLine("#!/bin/bash")
+        appendLine("# Native arm64 client first, official web client as the guaranteed fallback.")
+        nativePaths.forEach { path ->
+            appendLine("[ -x '$path' ] && exec '$path' \"\$@\" 2>/dev/null")
+        }
+        appendLine("exec /usr/local/bin/droiddesk-browser '$webUrl'")
     }
 
     private fun desktopEntry(
@@ -1582,6 +1818,7 @@ SESSEOF
                 actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 for label, handler in (
                     ("安装选中", self.install_selected),
+                    ("卸载选中", self.uninstall_selected),
                     ("安装 .deb", self.install_deb),
                     ("修复软件源", self.repair),
                 ):
@@ -1659,6 +1896,15 @@ SESSEOF
                 self.status.set_text("正在安装 " + pkg + " …")
                 self.spawn("DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends '%s'" % pkg,
                            lambda code: self.status.set_text("安装完成" if code == 0 else "安装失败，请查看下方日志"))
+
+            def uninstall_selected(self, _):
+                pkg = self.selected()
+                if not pkg:
+                    self.status.set_text("请先在列表中选择一个软件包。")
+                    return
+                self.status.set_text("正在卸载 " + pkg + " …")
+                self.spawn("DEBIAN_FRONTEND=noninteractive apt-get remove -y '%s'" % pkg,
+                           lambda code: self.status.set_text("卸载完成" if code == 0 else "卸载失败，请查看下方日志"))
 
             def install_deb(self, _):
                 dialog = Gtk.FileChooserDialog(title="选择 .deb 文件", parent=self,

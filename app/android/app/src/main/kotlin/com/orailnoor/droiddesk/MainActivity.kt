@@ -201,11 +201,25 @@ class MainActivity : FlutterActivity() {
     private var preinstall: com.orailnoor.droiddesk.runtime.PreinstallQueue? = null
 
     private fun preinstallQueue(): com.orailnoor.droiddesk.runtime.PreinstallQueue =
-        preinstall ?: com.orailnoor.droiddesk.runtime.PreinstallQueue(this) { command, timeout ->
-            // Only the rooted chroot path can apt-install the optional apps; the native
-            // prefix already has its package set and is left untouched.
-            chrootRuntime.runProvisioningCommand(command, timeout)
-        }.also { preinstall = it }
+        preinstall ?: com.orailnoor.droiddesk.runtime.PreinstallQueue(
+            this,
+            exec = { command, _ ->
+                // v2.0.0 always routed through the chroot helper, so a phone running the
+                // Termux/proot prefix recorded "-1 chroot 根文件系统尚未就绪" for every step.
+                // Dispatch to the runtime that is actually active.
+                if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
+                    chrootRuntime.runProvisioningCommand(command, timeoutSeconds = 900)
+                } else {
+                    val marker = "__DD_EXIT__"
+                    val output = linuxRuntime.executeCommand("$command; echo $marker\$?")
+                    val code = output.lineSequence()
+                        .lastOrNull { it.startsWith(marker) }
+                        ?.removePrefix(marker)?.trim()?.toIntOrNull() ?: -1
+                    com.orailnoor.droiddesk.runtime.PreinstallQueue.ShellResult(code, output)
+                }
+            },
+            ensureStore = { chrootRuntime.ensureGuestScripts() },
+        ).also { preinstall = it }
 
     /** Optional "Auto-Start Linux Desktop" setting: open the chroot desktop whenever the app starts. */
     private fun maybeAutoStartDesktop(launchIntent: Intent) {
@@ -413,7 +427,7 @@ class MainActivity : FlutterActivity() {
                         } else {
                             linuxRuntime.getInstalledDE()
                         },
-                        "rootfsPath" to if (rooted) chrootRuntime.getRootfsPath() else "",
+                        "rootfsPath" to if (rooted) chrootRuntime.rootfsPath else "",
                         "rootfsSizeMB" to if (rooted) chrootRuntime.getRootfsSizeMB() else 0L
                     ))
                 }
@@ -1010,19 +1024,22 @@ class MainActivity : FlutterActivity() {
                         // stopService and would keep the old framebuffer (and its guest)
                         // alive, which is what made "stop" look like it did nothing.
                         val activityGone = runCatching {
-                            com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(2_000)
+                            com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(2_500)
                         }.getOrDefault(false)
+                        var residual: List<Int> = emptyList()
                         runCatching {
-                            if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
-                                chrootRuntime.stopSession()
+                            residual = if (chrootRuntime.hasRoot()) {
+                                chrootRuntime.forceStopSession()
+                            } else {
+                                linuxRuntime.forceStopSession()
                             }
                         }.onFailure {
-                            failure = "chroot 会话停止失败：${it.message ?: it.javaClass.simpleName}"
-                            DesktopLog.append(this, TAG, "stopLinux chroot failure: ${it.message}")
+                            failure = "会话停止失败：${it.message ?: it.javaClass.simpleName}"
+                            DesktopLog.append(this, TAG, "stopLinux session failure: ${it.message}")
                         }
-                        runCatching { linuxRuntime.stopSession() }.onFailure {
-                            failure = failure ?: "Termux 会话停止失败：${it.message ?: it.javaClass.simpleName}"
-                            DesktopLog.append(this, TAG, "stopLinux native failure: ${it.message}")
+                        // The inactive runtime may still hold a stale session from a mode switch.
+                        if (chrootRuntime.hasRoot()) {
+                            runCatching { linuxRuntime.forceStopSession() }
                         }
                         runCatching {
                             stopService(Intent(this@MainActivity, X11ServerService::class.java))
@@ -1032,26 +1049,38 @@ class MainActivity : FlutterActivity() {
                         runCatching { stopForegroundService() }.onFailure {
                             failure = failure ?: "前台服务停止失败：${it.message ?: it.javaClass.simpleName}"
                         }
-                        // Report the state that actually survived, not what we wished for.
-                        val stillRunning = runCatching {
-                            if (chrootRuntime.hasRoot()) chrootRuntime.isRunning() else linuxRuntime.isRunning()
-                        }.getOrDefault(false)
+                        // Ground truth: the pid list plus both X sockets. isRunning() alone
+                        // can be null/stale after a process hand-off.
+                        val socketsLeft = listOf(
+                            java.io.File(filesDir, "tmp/.X11-unix/X0"),
+                            java.io.File(chrootRuntime.rootfsPath, "tmp/.X11-unix/X0"),
+                        ).filter { it.exists() }.map { it.absolutePath }
+                        val stillRunning = residual.isNotEmpty() ||
+                            runCatching {
+                                if (chrootRuntime.hasRoot()) chrootRuntime.isRunning() else linuxRuntime.isRunning()
+                            }.getOrDefault(false)
                         if (stillRunning && failure == null) {
-                            failure = "会话仍在运行，请重试（进程可能卡在卸载挂载点）"
+                            failure = if (residual.isNotEmpty()) {
+                                "仍有 ${residual.size} 个进程未退出（pid: ${residual.joinToString(",")}）"
+                            } else {
+                                "X 服务仍在运行"
+                            }
                         }
                         DesktopLog.append(
                             this,
                             "STOP",
                             "stopLinux wasRunning=$wasRunning activityGone=$activityGone " +
-                                "stillRunning=$stillRunning failure=$failure",
+                                "residual=$residual sockets=$socketsLeft failure=$failure",
                         )
                         runOnUiThread {
                             result.success(
-                                mapOf(
-                                    "ok" to (failure == null && !stillRunning),
+                                mapOf<String, Any?>(
+                                    "ok" to (failure == null && !stillRunning && socketsLeft.isEmpty()),
                                     "wasRunning" to wasRunning,
                                     "running" to stillRunning,
                                     "activityGone" to activityGone,
+                                    "residualPids" to residual,
+                                    "sockets" to socketsLeft,
                                     "message" to (failure ?: ""),
                                 ),
                             )
@@ -1147,10 +1176,13 @@ class MainActivity : FlutterActivity() {
                     runOnUiThread { result.success(outcome) }
                 }
 
-                // ── Background preinstall queue (Chrome/QQ/WeChat/Trae/store) ──
+                // ── Background preinstall queue (browser/QQ/WeChat/Trae/store) ──
                 "startPreinstall" -> {
                     val queue = preinstallQueue()
-                    queue.isAvailable = chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()
+                    // Both runtimes are valid deployment targets now: the proot prefix has
+                    // its own package manager, the chroot has apt.
+                    queue.isAvailable = (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) ||
+                        linuxRuntime.isRunning()
                     queue.startIfNeeded()
                     result.success(queue.summary())
                 }
@@ -1167,9 +1199,23 @@ class MainActivity : FlutterActivity() {
 
                 "retryPreinstall" -> {
                     val queue = preinstallQueue()
-                    queue.isAvailable = chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()
+                    queue.isAvailable = (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) ||
+                        linuxRuntime.isRunning()
                     queue.retryFailed()
                     result.success(queue.summary())
+                }
+
+                // Proof of what xfce actually loaded: locale inherited by xfce4-panel, the
+                // panel position xfconf resolved, icon theme on disk, browser + version.
+                "getDesktopDiagnostics" -> thread(name = "desktop-diagnostics") {
+                    val text = runCatching {
+                        if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
+                            chrootRuntime.readDiagnostics()
+                        } else {
+                            "当前为 Termux/proot 模式，诊断快照仅由 chroot 会话生成"
+                        }
+                    }.getOrDefault("诊断读取失败")
+                    runOnUiThread { result.success(mapOf("text" to text)) }
                 }
 
                 // ── Desktop crash journal ──

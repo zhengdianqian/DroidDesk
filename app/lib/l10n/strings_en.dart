@@ -133,12 +133,15 @@ const Map<String, String> enStrings = {
   'common.close': 'Close',
   'settings.preinstall.title': 'Preinstalled apps',
   'settings.preinstall.subtitle':
-      'Background serial install of Chromium, Trae, QQ, WeChat and the store entry',
+      'Background serial install of an arm64 browser, Trae, QQ, WeChat and the apt store',
   'settings.preinstall.progress':
       '{done}/{total} done, {skipped} skipped (tap for details)',
   'settings.preinstall.hint':
       'Installs run one by one in the background. A package without an arm64 build is skipped and recorded; other apps and the desktop are unaffected.',
   'settings.preinstall.retry': 'Retry failed',
+  'settings.preinstall.details': 'Full output',
+  'settings.diagnostics.title': 'Desktop diagnostics',
+  'settings.diagnostics.unavailable': 'Diagnostics unavailable',
   'settings.stability.log.title': 'Desktop log',
   'settings.stability.log.subtitle': 'Full record of session crashes and failed installs',
   'settings.stability.log.offSubtitle':

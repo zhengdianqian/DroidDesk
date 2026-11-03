@@ -87,18 +87,32 @@ class DroidDeskService : Service() {
         runCatching { DesktopActivity.teardownAndAwait(2_000) }
         thread(name = "notification-stop-linux") {
             var failure: String? = null
+            var residual: List<Int> = emptyList()
             try {
                 val chrootRuntime = ChrootRuntime(this)
-                if (chrootRuntime.hasRoot() && chrootRuntime.isRunning()) {
-                    chrootRuntime.stopSession()
+                residual = if (chrootRuntime.hasRoot()) {
+                    // forceStopSession SIGKILLs every process still bound to the rootfs and
+                    // reports survivors; a null sessionProcess must not count as success.
+                    chrootRuntime.forceStopSession()
+                } else {
+                    LinuxRuntime(this).forceStopSession()
                 }
-                LinuxRuntime(this).stopSession()
+                if (chrootRuntime.hasRoot()) {
+                    runCatching { LinuxRuntime(this).forceStopSession() }
+                }
                 stopService(Intent(this, X11ServerService::class.java))
             } catch (error: Throwable) {
                 failure = error.message ?: error.javaClass.simpleName
                 Log.e(TAG, "Failed to stop the Linux desktop from the notification", error)
             } finally {
-                DesktopLog.append(this, TAG, "stopDesktop finished, failure=$failure")
+                if (failure == null && residual.isNotEmpty()) {
+                    failure = "仍有 ${residual.size} 个进程未退出（pid: ${residual.joinToString(",")}）"
+                }
+                DesktopLog.append(
+                    this,
+                    TAG,
+                    "stopDesktop finished, failure=$failure residual=$residual",
+                )
                 // Keep the notification truthful: on failure the service stays alive and the
                 // button stays clickable instead of pretending the desktop was stopped.
                 if (failure == null) {

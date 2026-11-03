@@ -21,9 +21,10 @@ import kotlin.math.roundToInt
  */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_VERSION = "v19"
+    private const val PROFILE_VERSION = "v20"
     private const val MONOSPACE_FONT = "DejaVu Sans Mono"
     private const val WALLPAPER_ASSET = "droiddesk/sunset-wave-wallpaper.jpg"
+    private const val ICON_ASSET_DIR = "droiddesk/icons"
 
     /** Width of the vertical left launcher dock at the reference scale (1.5x). */
     const val BASE_DOCK_SIZE_PX = 88
@@ -59,22 +60,36 @@ object XfceMobileProfile {
         if (marker.exists()) return true
 
         return try {
-            wallpaperFile.parentFile?.mkdirs()
-            context.assets.open(WALLPAPER_ASSET).use { input ->
-                wallpaperFile.outputStream().use(input::copyTo)
-            }
-
             val s = scaleFactor(uiScale)
             val dpi = DisplayProfile.xftDpi(uiScale)
+
+            // Decorative only: a missing/corrupt wallpaper must not abort the profile.
+            // v2.0.0 aborted the entire install when the wallpaper lookup failed, which
+            // left xfce with its stock panel/icons. The copy now happens first but its
+            // failure only degrades the backdrop to solid Ubuntu aubergine.
+            val wallpaperReady = runCatching {
+                wallpaperFile.parentFile?.mkdirs()
+                context.assets.open(WALLPAPER_ASSET).use { input ->
+                    wallpaperFile.outputStream().use(input::copyTo)
+                }
+                true
+            }.getOrElse {
+                Log.w(TAG, "Wallpaper asset unavailable, using solid Ubuntu background: ${it.message}")
+                false
+            }
 
             val xfconfDir = File(
                 homeDir,
                 ".config/xfce4/xfconf/xfce-perchannel-xml",
             ).apply { mkdirs() }
+
+            val wallpaperPath = if (wallpaperReady) {
+                xmlEscape(wallpaperPathInSession)
+            } else {
+                "#2C001E"
+            }
             File(xfconfDir, "xfce4-panel.xml").writeText(panelConfig(s, powerMode))
-            File(xfconfDir, "xfce4-desktop.xml").writeText(
-                desktopConfig(xmlEscape(wallpaperPathInSession), s),
-            )
+            File(xfconfDir, "xfce4-desktop.xml").writeText(desktopConfig(wallpaperPath, s))
             File(xfconfDir, "xfwm4.xml").writeText(windowManagerConfig(s))
             File(xfconfDir, "xsettings.xml").writeText(
                 xsettingsConfig(dpi, s, iconTheme),
@@ -84,50 +99,71 @@ object XfceMobileProfile {
             installPanelCss(homeDir, s)
             installAutoMaximize(homeDir)
             installGtkSettings(homeDir, animations = false)
+            installIconAssets(context, homeDir)
 
             val panelDir = File(homeDir, ".config/xfce4/panel")
             writeLauncher(
                 File(panelDir, "launcher-21/droiddesk-store.desktop"),
-                name = "Ubuntu Software",
+                name = "Ubuntu 软件",
                 comment = "Install Linux applications and .deb packages (apt front end)",
                 exec = "/usr/local/bin/droiddesk-store",
-                icon = "system-software-install",
+                icon = "droiddesk-store",
             )
             writeLauncher(
                 File(panelDir, "launcher-22/droiddesk-terminal.desktop"),
-                name = "Terminal",
+                name = "终端",
                 comment = "Open the Linux terminal",
                 exec = "xfce4-terminal",
-                icon = "utilities-terminal",
+                icon = "droiddesk-terminal",
             )
             writeLauncher(
                 File(panelDir, "launcher-23/droiddesk-files.desktop"),
-                name = "Files",
+                name = "文件",
                 comment = "Browse files",
                 exec = "thunar %u",
-                icon = "system-file-manager",
+                icon = "droiddesk-files",
             )
+            // One helper resolves the browser that the preinstall step actually managed to
+            // install (Chrome arm64 / chromium / epiphany / firefox), so the icon never
+            // points at a hard-coded google-chrome that may be absent.
             writeLauncher(
                 File(panelDir, "launcher-24/droiddesk-browser.desktop"),
-                name = "Web Browser",
+                name = "浏览器",
                 comment = "Browse the web",
-                exec = "exo-open --launch WebBrowser %u",
-                icon = "web-browser",
+                exec = "/usr/local/bin/droiddesk-browser %u",
+                icon = "droiddesk-browser",
             )
             writeLauncher(
                 File(panelDir, "launcher-25/droiddesk-settings.desktop"),
-                name = "Settings",
+                name = "设置",
                 comment = "Display, network and input settings",
                 exec = "xfce4-settings-manager",
-                icon = "preferences-system",
+                icon = "droiddesk-settings",
+            )
+            // These helpers open the native client when it is installed and fall back to
+            // the official web client otherwise (both Linux clients' arm64 builds are
+            // handled by the preinstall queue).
+            writeLauncher(
+                File(panelDir, "launcher-26/droiddesk-qq.desktop"),
+                name = "QQ",
+                comment = "QQ (native arm64 package, web client as fallback)",
+                exec = "/usr/local/bin/droiddesk-qq",
+                icon = "droiddesk-qq",
+            )
+            writeLauncher(
+                File(panelDir, "launcher-27/droiddesk-wechat.desktop"),
+                name = "微信",
+                comment = "WeChat (native arm64 package, web client as fallback)",
+                exec = "/usr/local/bin/droiddesk-wechat",
+                icon = "droiddesk-wechat",
             )
             // Desktop shortcut for the store, so it is reachable without the dock.
             writeLauncher(
                 File(homeDir, "Desktop/droiddesk-store.desktop"),
-                name = "Ubuntu Software",
+                name = "Ubuntu 软件",
                 comment = "Install Linux applications",
                 exec = "/usr/local/bin/droiddesk-store",
-                icon = "system-software-install",
+                icon = "droiddesk-store",
             )
 
             marker.writeText(
@@ -297,9 +333,9 @@ object XfceMobileProfile {
 
     private fun xsettingsConfig(dpi: Int, s: Double, iconTheme: String): String {
         val cursor = (32 * s).roundToInt().coerceAtLeast(24)
-        // Ubuntu 24.04 look: dark widgets, Yaru icons when the package is installed (the
-        // installer preinstalls yaru-theme-icon). Papirus is the fallback already used by
-        // older profiles; Adwaita is the last resort so icons always resolve.
+        // Ubuntu 24.04 look: dark widgets, Yaru icons when the preinstall step managed to
+        // install yaru-theme-icon. Any other installed theme (Papirus/Adwaita) is used
+        // verbatim; the dock's own icons come from the APK and live in hicolor.
         val themeName = if (iconTheme == "Yaru") "Yaru-dark" else "Adwaita-dark"
         return """
             <?xml version="1.1" encoding="UTF-8"?>
@@ -314,6 +350,7 @@ object XfceMobileProfile {
               <property name="Net" type="empty">
                 <property name="ThemeName" type="string" value="$themeName"/>
                 <property name="IconThemeName" type="string" value="$iconTheme"/>
+                <property name="CursorThemeName" type="string" value="Adwaita"/>
                 <property name="CursorSize" type="int" value="$cursor"/>
               </property>
               <property name="Gtk" type="empty">
@@ -403,10 +440,12 @@ object XfceMobileProfile {
                   </property>
                 </property>
                 <property name="panel-2" type="empty">
-                  <!-- Ubuntu-style launcher: left edge, vertical, full height. p=2 is
-                       xfce4-panel's left snap position; mode=1 makes the plugins stack
-                       top-to-bottom instead of a horizontal strip. -->
-                  <property name="position" type="string" value="p=2;x=0;y=0"/>
+                  <!-- Ubuntu-style launcher: left edge, vertical, full height. p is
+                       xfce4-panel's SnapPosition enum index, NOT a bitmap:
+                       6=NORTH, 10=SOUTH, 5=W (left edge), 2=NE (top-right corner).
+                       v2.0.0 used p=2, which is why the "left" dock rendered on the
+                       right edge. mode=1 stacks the plugins vertically. -->
+                  <property name="position" type="string" value="p=5;x=0;y=0"/>
                   <property name="mode" type="uint" value="1"/>
                   <!-- For a vertical panel "size" is the dock WIDTH; "length" is the
                        height percentage, same unit as panel-1. -->
@@ -429,6 +468,8 @@ object XfceMobileProfile {
                     <value type="int" value="23"/>
                     <value type="int" value="24"/>
                     <value type="int" value="25"/>
+                    <value type="int" value="26"/>
+                    <value type="int" value="27"/>
                   </property>
                 </property>
               </property>
@@ -480,9 +521,39 @@ object XfceMobileProfile {
                     <value type="string" value="droiddesk-settings.desktop"/>
                   </property>
                 </property>
+                <property name="plugin-26" type="string" value="launcher">
+                  <property name="items" type="array">
+                    <value type="string" value="droiddesk-qq.desktop"/>
+                  </property>
+                </property>
+                <property name="plugin-27" type="string" value="launcher">
+                  <property name="items" type="array">
+                    <value type="string" value="droiddesk-wechat.desktop"/>
+                  </property>
+                </property>
               </property>
             </channel>
         """.trimIndent() + "\n"
+    }
+
+    /**
+     * Ships the dock/launcher icons inside the APK and installs them into the user's
+     * hicolor theme, so the desktop looks the same offline and without a theme package.
+     * Missing assets only log a warning; launchers then fall back to stock icons.
+     */
+    private fun installIconAssets(context: Context, homeDir: File) {
+        val targetDir = File(homeDir, ".local/share/icons/hicolor/scalable/apps").apply { mkdirs() }
+        runCatching {
+            val names = context.assets.list(ICON_ASSET_DIR).orEmpty()
+            names.filter { it.endsWith(".svg") }.forEach { name ->
+                context.assets.open("$ICON_ASSET_DIR/$name").use { input ->
+                    File(targetDir, name).outputStream().use(input::copyTo)
+                }
+                DesktopLog.append(context, TAG, "icon installed: $name")
+            }
+        }.onFailure {
+            Log.w(TAG, "Bundled icons unavailable: ${it.message}")
+        }
     }
 
     private fun desktopConfig(wallpaperPath: String, s: Double): String {
@@ -490,13 +561,31 @@ object XfceMobileProfile {
         // on others, and the name can change with the framebuffer size. Writing only
         // one of them left the desktop pure black after a resolution switch.
         val monitors = listOf("monitorbuiltin", "monitor0", "monitor1", "monitor2", "monitor3")
+        val solid = wallpaperPath.startsWith("#")
+        val backdropBody = if (solid) {
+            """
+            <property name="color-style" type="int" value="0"/>
+            <property name="image-style" type="int" value="0"/>
+            <!-- Ubuntu aubergine, used when the wallpaper asset is unavailable. -->
+            <property name="rgba1" type="array">
+              <value type="double" value="0.172549"/>
+              <value type="double" value="0.000000"/>
+              <value type="double" value="0.117647"/>
+              <value type="double" value="1.000000"/>
+            </property>
+            """.trimIndent()
+        } else {
+            """
+            <property name="color-style" type="int" value="0"/>
+            <property name="image-style" type="int" value="5"/>
+            <property name="last-image" type="string" value="$wallpaperPath"/>
+            """.trimIndent()
+        }
         val backdrops = monitors.joinToString("\n") { name ->
             """
             <property name="$name" type="empty">
               <property name="workspace0" type="empty">
-                <property name="color-style" type="int" value="0"/>
-                <property name="image-style" type="int" value="5"/>
-                <property name="last-image" type="string" value="$wallpaperPath"/>
+            $backdropBody
               </property>
             </property>
             """.trimIndent()

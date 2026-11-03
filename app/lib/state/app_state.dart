@@ -483,6 +483,14 @@ class AppState extends ChangeNotifier {
     await refreshPreinstallStatus();
   }
 
+  Future<String> loadDesktopDiagnostics() async {
+    try {
+      return await DroidDeskPlatform.getDesktopDiagnostics();
+    } catch (_) {
+      return AppStrings.t('settings.diagnostics.unavailable');
+    }
+  }
+
   Future<String> loadDesktopLog() async {
     _desktopLog = await DroidDeskPlatform.getDesktopLog();
     notifyListeners();

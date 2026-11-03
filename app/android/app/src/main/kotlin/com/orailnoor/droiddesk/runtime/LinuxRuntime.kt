@@ -3719,6 +3719,39 @@ DROIDDESK_X11
         Log.i(TAG, "Session stopped")
     }
 
+    /**
+     * Stops the Termux/proot session and returns pids that still reference the prefix.
+     * A non-empty list means the desktop is genuinely still alive, so the UI must not
+     * report success. Uses a bounded SIGKILL pass, not a standing watchdog.
+     */
+    fun forceStopSession(): List<Int> {
+        stopSession()
+        var residual = listSessionPids()
+        if (residual.isNotEmpty()) {
+            residual.forEach { pid ->
+                runCatching {
+                    ProcessBuilder("/system/bin/kill", "-9", pid.toString()).start().waitFor()
+                }
+            }
+            Thread.sleep(350)
+            residual = listSessionPids()
+        }
+        return residual
+    }
+
+    /** Pids whose /proc cmdline still contains this prefix directory (proot + X apps). */
+    fun listSessionPids(): List<Int> {
+        val marker = prefixDir.absolutePath
+        val procs = File("/proc").listFiles() ?: return emptyList()
+        return procs.mapNotNull { dir ->
+            val pid = dir.name.toIntOrNull() ?: return@mapNotNull null
+            val cmdline = runCatching {
+                File(dir, "cmdline").readText().replace('\u0000', ' ')
+            }.getOrDefault("")
+            if (cmdline.contains(marker)) pid else null
+        }.distinct()
+    }
+
     // ── Command Execution ──
 
     /**
