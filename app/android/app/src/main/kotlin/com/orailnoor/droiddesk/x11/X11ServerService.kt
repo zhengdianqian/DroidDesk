@@ -20,7 +20,6 @@ import java.util.concurrent.CountDownLatch
  */
 class X11ServerService : Service() {
     private lateinit var serverThread: HandlerThread
-    private lateinit var serverHandler: Handler
 
     private val stateLock = Any()
     private var startLatch: CountDownLatch? = null
@@ -48,7 +47,6 @@ class X11ServerService : Service() {
         super.onCreate()
         serverThread = HandlerThread("X11Server")
         serverThread.start()
-        serverHandler = Handler(serverThread.looper)
         Log.i(TAG, "X11 service created in pid=${android.os.Process.myPid()}")
     }
 
@@ -82,21 +80,26 @@ class X11ServerService : Service() {
             } else {
                 latch = CountDownLatch(1)
                 startLatch = latch
-                serverHandler.post {
+                // libXlorie takes the calling thread's Choreographer while starting; from a
+                // HandlerThread that instance is null and the native start SIGSEGVs
+                // (tombstone: Choreographer::postFrameCallbackDelayed). Start on main instead.
+                Handler(android.os.Looper.getMainLooper()).post {
                     startSucceeded = try {
                         configureEnvironment()
                         Log.i(TAG, "Starting native X server in pid=${android.os.Process.myPid()}")
-                        CmdEntryPoint.start(arrayOf(":0", "-nolock"))
+                        // "-nolock" is rejected for app users ("AddExtensions failed"), so the
+                        // stale lock is removed in configureEnvironment() instead.
+                        CmdEntryPoint.start(arrayOf(":0"))
                     } catch (error: Throwable) {
                         Log.e(TAG, "Native X server failed to start", error)
                         false
                     } finally {
-                        // A failed start used to latch success=false for the lifetime of the
-                        // process; retrying asked a dead CmdEntryPoint again and every later
-                        // resolution switch inherited the broken server. Only a real success
-                        // is sticky, failures release the latch so a fresh attempt can run.
-                        started = startSucceeded
-                        if (!startSucceeded) startLatch = null
+                        // Exactly one native start per service process. A second
+                        // CmdEntryPoint.start corrupts libXlorie's allocator (Scudo
+                        // "invalid chunk state") and SIGSEGVs the server thread before it
+                        // can create the display socket. A failed process is torn down and
+                        // restarted fresh by the client instead of retried in place.
+                        started = true
                         latch.countDown()
                     }
                     Log.i(TAG, "Native X server start result=$startSucceeded")
@@ -134,6 +137,10 @@ class X11ServerService : Service() {
         val staleSocket = File(appTmpDir, ".X11-unix/X0")
         if (staleSocket.exists() && !staleSocket.delete()) {
             Log.w(TAG, "Could not remove stale X11 socket ${staleSocket.absolutePath}")
+        }
+        val staleLock = File(appTmpDir, ".X0-lock")
+        if (staleLock.exists() && !staleLock.delete()) {
+            Log.w(TAG, "Could not remove stale X11 lock ${staleLock.absolutePath}")
         }
     }
 

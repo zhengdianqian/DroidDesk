@@ -2611,7 +2611,7 @@ class LinuxRuntime(private val context: Context) {
             // original Termux shebangs, which would break them at launch time.
             runCatching { patchShebangs(force = true) }
 
-            val detail = (installOutput + fixOutput).toString()
+            val detail = (installOutput.toString() + fixOutput.toString())
                 .lines().filter { it.isNotBlank() }.takeLast(6).joinToString("\n")
             val accepted = install == 0
             val ok = accepted || detail.contains("already the newest version", ignoreCase = true)
