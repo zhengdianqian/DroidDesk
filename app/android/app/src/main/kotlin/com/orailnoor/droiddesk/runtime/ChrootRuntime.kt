@@ -204,12 +204,16 @@ class ChrootRuntime(private val context: Context) {
 
                 onProgress(0.05, t("正在探测最快的 APT 镜像…", "Selecting fastest APT mirror..."))
                 val codename = MirrorSelector.detectCodename(rootfsDir)
-                val mirrors = MirrorSelector.probeReachable(codename)
-                var aptUpdated = false
-                if (mirrors.isEmpty()) {
-                    // No mirror answered the HEAD probe (offline?); try existing sources.
-                    aptUpdated = execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0
-                } else {
+                val probed = MirrorSelector.probeReachable(codename)
+                // A failed probe means the network is unreachable, not that the mirror
+                // is gone. Try every candidate in preference order and let apt-get
+                // update be the judge.
+                val mirrors = MirrorSelector.orderedCandidates(codename)
+                if (probed.isEmpty()) {
+                    onLog(t("镜像探测全部失败（网络不可达），将按优先级尝试…\n", "Mirror probes failed (network unreachable); trying candidates in order...\n"))
+                }
+                var aptUpdated = execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0
+                if (!aptUpdated) {
                     for (mirror in mirrors) {
                         onLog(t("正在使用 APT 镜像 $mirror（$codename，arm64）\n", "Using APT mirror $mirror ($codename, arm64)\n"))
                         MirrorSelector.writeSources(rootfsDir, mirror, codename)
@@ -228,7 +232,7 @@ class ChrootRuntime(private val context: Context) {
                     }
                 }
                 if (!aptUpdated) {
-                    throw IllegalStateException(t("软件包索引更新失败（所有镜像均不可用）", "Package index update failed (all mirrors unreachable)"))
+                    throw IllegalStateException(t("软件包索引更新失败：网络不可达或所有镜像均不可用", "Package index update failed: network unreachable or every mirror is down"))
                 }
 
                 onProgress(0.1, t("正在安装 Android 内核兼容组件…", "Installing Android kernel compatibility..."))
@@ -1426,25 +1430,39 @@ SESSEOF
         }
     }
 
-    /** Switches the guest to the fastest reachable domestic mirror and refreshes the index. */
-    fun applyBestMirror(onLog: (String) -> Unit = {}): Boolean {
-        if (!hasRoot()) return false
+    /**
+     * Switches the rootfs to the best domestic Ubuntu mirror.
+     *
+     * Returns a structured code instead of a bare Boolean so the UI can tell "the device
+     * has no network" apart from "the mirror index is broken"; both used to be reported
+     * as "no usable mirror" even when the mirror itself was fine.
+     */
+    fun applyBestMirror(onLog: (String) -> Unit = {}): String {
+        if (!hasRoot()) return "Unsupported"
         ensureMounts()
         val codename = MirrorSelector.detectCodename(rootfsDir)
-        val mirrors = MirrorSelector.probeReachable(codename)
-        if (mirrors.isEmpty()) {
-            onLog(t("未探测到可用的国内镜像，保留现有软件源。\n", "No reachable domestic mirror found; keeping current sources.\n"))
-            return false
+        val mirrors = MirrorSelector.orderedCandidates(codename)
+        // Probes run on the Android side and fail as a group when the device resolver or
+        // the host proxy is broken. They only word the final message; they never decide.
+        val reachability = MirrorSelector.reachability(codename)
+        if (reachability == MirrorSelector.Reachability.UNREACHABLE) {
+            onLog(t("镜像探测不可达（可能是设备 DNS/代理问题），仍按优先级逐个尝试…\n", "Mirror probes are unreachable (device DNS/proxy?); still trying mirrors in order...\n"))
         }
         for (mirror in mirrors) {
             MirrorSelector.writeSources(rootfsDir, mirror, codename)
             onLog(t("已写入镜像 $mirror，正在刷新索引…\n", "Mirror $mirror written; refreshing index...\n"))
             if (execChroot("DEBIAN_FRONTEND=noninteractive apt-get update", onLog) == 0) {
                 onLog(t("软件源已切换到 $mirror\n", "APT mirror switched to $mirror\n"))
-                return true
+                return "Ok"
             }
         }
-        return false
+        return if (reachability == MirrorSelector.Reachability.UNREACHABLE) {
+            onLog(t("网络不可达：所有镜像均无法刷新索引，请检查网络或代理。\n", "Network unreachable: no mirror could refresh its index; check the network or proxy.\n"))
+            "NoNetwork"
+        } else {
+            onLog(t("镜像不可用：网络可达但索引刷新失败，请查看 apt 输出。\n", "Mirror unavailable: the network is reachable but index refresh failed; see apt output.\n"))
+            "AptFailed"
+        }
     }
 
     /** Installs a .deb selected in the Android file picker, then fixes dependencies. */
@@ -1676,14 +1694,29 @@ SESSEOF
         # Writes 1 when IBus reports that an editable input context gained focus.
         # GTK/Qt only create a context for text widgets, so this does not fire for
         # plain window focus. Android polls this file to show the soft keyboard.
+        # A FocusIn alone is still not enough: the session manager focuses the first
+        # window at cold start. Only report 1 after a real touch landed on the X
+        # surface (Android bumps ime-tap on every ACTION_DOWN).
         BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
+        TAPFILE="${'$'}BRIDGE/ime-tap"
         mkdir -p "${'$'}BRIDGE"
         printf '0\n' > "${'$'}BRIDGE/ime-focus"
+        LASTTAP=""
+        ARMED=0
         dbus-monitor --session "interface='org.freedesktop.IBus.Panel'" 2>/dev/null |
         while read -r line; do
+          tap="${'$'}(cat "${'$'}TAPFILE" 2>/dev/null)"
+          if [ -n "${'$'}tap" ] && [ "${'$'}tap" != "${'$'}LASTTAP" ]; then
+            LASTTAP="${'$'}tap"
+            ARMED=1
+          fi
           case "${'$'}line" in
-            *"member=FocusIn"*)  printf '1\n' > "${'$'}BRIDGE/ime-focus" ;;
-            *"member=FocusOut"*) printf '0\n' > "${'$'}BRIDGE/ime-focus" ;;
+            *"member=FocusIn"*)
+              if [ "${'$'}ARMED" = "1" ]; then printf '1\n' > "${'$'}BRIDGE/ime-focus"
+              else printf '0\n' > "${'$'}BRIDGE/ime-focus"; fi ;;
+            *"member=FocusOut"*)
+              printf '0\n' > "${'$'}BRIDGE/ime-focus"
+              ARMED=0 ;;
           esac
         done
     """.trimIndent() + "\n"

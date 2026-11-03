@@ -11,6 +11,7 @@ import com.termux.x11.input.TouchInputHandler
 class X11InputController(
     private val lorieView: LorieView,
     onThreeFingerTap: () -> Unit = {},
+    onTapUp: () -> Unit = {},
 ) {
     private val inputHandler = TouchInputHandler(
         MainActivity.getInstance(),
@@ -23,6 +24,11 @@ class X11InputController(
     var mode: Int = savedModes.getInt(KEY_MODE, TouchInputHandler.InputMode.TRACKPAD)
         private set
 
+    /** Down position/time used to tell a real tap from a pan, swipe or long press. */
+    private var downAtMs = 0L
+    private var downX = 0f
+    private var downY = 0f
+
     init {
         setMode(mode)
         MainActivity.getInstance().setKeyHandler(inputHandler::sendKeyEvent)
@@ -30,7 +36,31 @@ class X11InputController(
         lorieView.setCallback { width, height, transform ->
             inputHandler.handleInputTransformChanged(width, height, transform)
         }
-        lorieView.setOnTouchListener(::handleMotionEvent)
+        val tapSlop = 8 * lorieView.context.resources.displayMetrics.density
+        val tapTimeoutMs = 300L
+        lorieView.setOnTouchListener { view, event ->
+            // Observe only: input handling still belongs to TouchInputHandler. The IME
+            // bridge learns from this that a human tapped the desktop, which keeps an
+            // auto-focused window at cold start from opening the keyboard. Only a short,
+            // motionless ACTION_UP counts: a scroll or a long press is not a tap on a
+            // text widget, and acting on ACTION_DOWN popped the keyboard while scrolling.
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downAtMs = android.os.SystemClock.uptimeMillis()
+                    downX = event.x
+                    downY = event.y
+                }
+                MotionEvent.ACTION_UP -> {
+                    val held = android.os.SystemClock.uptimeMillis() - downAtMs
+                    val moved = kotlin.math.hypot(
+                        (event.x - downX).toDouble(),
+                        (event.y - downY).toDouble(),
+                    )
+                    if (held < tapTimeoutMs && moved < tapSlop) onTapUp()
+                }
+            }
+            inputHandler.handleTouchEvent(lorieView, view, event)
+        }
         lorieView.setOnGenericMotionListener(::handleMotionEvent)
     }
 

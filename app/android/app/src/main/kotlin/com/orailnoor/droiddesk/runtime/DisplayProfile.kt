@@ -61,6 +61,14 @@ object DisplayProfile {
     fun autoIme(context: Context): Boolean =
         prefs(context).getBoolean("flutter.ddAutoIme", true)
 
+    /**
+     * Keep the screen awake while the desktop is in front. Defaults to false: following the
+     * system timeout is the power-saving behaviour, and a desktop that never sleeps drains
+     * the battery even when nobody is looking at it.
+     */
+    fun keepScreenOn(context: Context): Boolean =
+        prefs(context).getBoolean("flutter.ddKeepScreenOn", false)
+
     fun xftDpi(scale: Double): Int = (96.0 * scale).roundToInt()
 
     /** Real panel size in physical pixels (system bars included; the desktop is fullscreen). */

@@ -1158,13 +1158,16 @@ class MainActivity : FlutterActivity() {
                                 )
                             }
                         }
-                        val ok = if (chrootRuntime.hasRoot()) {
-                            chrootRuntime.applyBestMirror(log)
-                        } else {
-                            // The native runtime uses Termux repositories, not Ubuntu ports.
-                            false
+                        // Structured result: Ok / NoNetwork / ProbeInconclusive /
+                        // AptFailed / Unsupported. The UI must not turn a broken
+                        // device resolver into "no usable mirror".
+                        val code = when {
+                            chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady() ->
+                                chrootRuntime.applyBestMirror(log)
+                            linuxRuntime.isBootstrapped() -> linuxRuntime.applyTermuxMirror(log)
+                            else -> "Unsupported"
                         }
-                        runOnUiThread { result.success(ok) }
+                        runOnUiThread { result.success(code) }
                     }
                 }
 
@@ -1196,14 +1199,48 @@ class MainActivity : FlutterActivity() {
                 "restartDesktopForDisplay" -> {
                     val before = DisplayProfile.effectiveSize(this)
                     thread(name = "display-restart") {
+                        // 1. The old DesktopActivity still binds the :x11 service through
+                        //    X11ServiceClient, and a bound service is never destroyed by
+                        //    stopService. Finish it and wait for onDestroy (which unbinds
+                        //    synchronously) before touching the service at all.
+                        val activityGone = com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(3_000)
                         if (chrootRuntime.isRunning()) chrootRuntime.stopSession()
                         if (linuxRuntime.isRunning()) linuxRuntime.stopSession()
+                        // Write the new geometry to the X server preferences BEFORE the
+                        // old server dies, so the replacement reads the new size instead
+                        // of resurrecting the old framebuffer.
+                        DisplayProfile.applyToX11(this)
                         stopService(Intent(this@MainActivity, X11ServerService::class.java))
+                        // The real socket lives in filesDir/tmp: X11ServerService sets
+                        // TMPDIR to that directory, and LinuxRuntime binds it to /tmp.
+                        // The old "usr/tmp" path never existed, so the socket survived.
+                        val x11Tmp = java.io.File(filesDir, "tmp")
+                        val socket = java.io.File(x11Tmp, ".X11-unix/X0")
+                        val deadline = android.os.SystemClock.uptimeMillis() + 3_000
+                        while (socket.exists() && android.os.SystemClock.uptimeMillis() < deadline) {
+                            Thread.sleep(100)
+                        }
+                        var killed = false
+                        if (socket.exists()) {
+                            val pid = com.orailnoor.droiddesk.x11.X11ServiceClient.connectedServerPid
+                            if (pid > 0) {
+                                killed = runCatching { android.os.Process.killProcess(pid) }.isSuccess
+                                DesktopLog.append(
+                                    this@MainActivity,
+                                    TAG,
+                                    "X server pid $pid still alive after stop; kill=$killed",
+                                )
+                            }
+                        }
+                        socket.delete()
+                        java.io.File(x11Tmp, ".X11-unix").delete()
+                        java.io.File(x11Tmp, ".X0-lock").delete()
                         val after = DisplayProfile.effectiveSize(this)
                         DesktopLog.append(
                             this@MainActivity,
                             TAG,
-                            "display change restart: ${before.x}x${before.y} -> ${after.x}x${after.y}",
+                            "display change restart: ${before.x}x${before.y} -> ${after.x}x${after.y}, " +
+                                "activityGone=$activityGone killed=$killed socket=${socket.exists()}",
                         )
                         runOnUiThread {
                             result.success(

@@ -80,10 +80,17 @@ jobs:
             基于 1.4.4 继续迭代，versionCode 14，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
             ### 1.4.5 更新
-            - 窗口管理器兜底：桌面会话启动后检查 `_NET_SUPPORTING_WM_CHECK`，确认 xfwm4 存活；冷启动崩溃时用会话总线环境重启一次（只重试一次，不驻留看护），并把 xfwm4 的 stderr 写入桌面日志
-            - 商店装包：apt 显式重定位 `Dir::Etc`/`Dir::State`/`Dir::Bin::Methods` 与 dpkg 状态库，导出 `PREFIX`/`TERMUX_PREFIX`/`APT_CONFIG`/`DPKG_ADMINDIR` 到桌面终端；PRoot 容器把 `/data/data/com.termux/files/usr` 绑到应用前缀；宿主 `127.0.0.1:2080` 代理探测可用才写入，不可用则移除
+            - 分辨率切换（修复必须重启 App）：先让旧桌面 Activity 同步收尾并解绑 `:x11`，再停会话/停服务，轮询真实的 `tmp/.X11-unix/X0` 消失（最多 3s，仍在则杀进程兜底），确认旧 X server 真死才重连；`started` 标记失败可重置
+            - 中文提交（修复丢字/串字）：`XChangeKeyboardMapping` 批量占用专用键码，一次 `XSync`+150ms 后连续 tap，用完统一还原；找不到空键码直接失败并写日志，不再覆盖 255
+            - 输入法组合文本：`finishComposingText` 先删预览再清空；`deleteSurroundingText` 只删自身镜像范围并同步回写；补 `deleteSurroundingTextInCodePoints`；长度统一按码点计算（emoji 不再多删）
+            - 启动误弹/二次不弹：`ime-focus` 只有在“真实点击 + 命中白名单窗口”后才置 1；会话揭示后前 3 秒的焦点变化只记录；点击改为 `ACTION_UP`（<8dp、<300ms）判定；`showKeyboard` 幂等、`hideKeyboard` 回写 0 并清状态
+            - 一键换源：非 root 运行时真正写入 Termux 镜像源并刷新索引；返回值改为 `Ok/NoNetwork/AptFailed/Unsupported` 结构化结果，文案区分“网络不可达/索引刷新失败/不支持”；镜像探测改 `GET + Range: bytes=0-0`
+            - 商店 apt 路径：`.bashrc` 幂等导出 `LD_PRELOAD=libsocket_hook.so`，shell/面板派生的 apt 也带路径重写；会话启动写 `$PREFIX/etc/resolv.conf` 并把镜像 IP pin 进 `$PREFIX/etc/hosts`；代理失效时同时清掉 `.bashrc` 中的代理块
+            - 窗口管理器兜底：`_NET_SUPPORTING_WM_CHECK` 取出窗口 id 后再 `xprop -id` 验证窗口存活，避免假阳性；最长等 40s 且从 `xfce4-panel` 出现开始计时，失败只重启一次并把结果写入 `wm-ok`；就绪判定要求 `xfce4-panel` 与 `xfwm4` 都在
+            - 会话残留：清理时额外杀掉旧 `ime-watch`、`droiddesk-x11-focus`、`xclip/xsel`，避免旧 watcher 跨会话把 `ime-focus` 写成 1
+            - 省电：`FLAG_KEEP_SCREEN_ON` 改为默认跟随系统（切后台清除）；焦点监听改为 `xprop -root -spy` 事件驱动（不再每 0.3s 起一个 X 客户端）；剪贴板改为事件监听 + 低频兜底；`XfceMobileProfile` 传入用户选择的 `uiScale`/`powerMode`；桌面日志改为内存缓冲 + 单线程批量落盘
+            - 更新检查：版本比较包含 build 号，同版本号补丁包可被识别；只接受 arm64 正式签名包，拒绝 debug/unsigned/x86/armv7；限流时也记录检查时间
             - 桌面观感：底部 Dock 增加设置入口、圆角与悬停反馈，常用应用的 `.desktop` 自动复制到桌面
-            - 输入法：候选词连击与多字中文提交去重路径复核，补全日志
 
             ### 1.4.4 更新（沿用）
             - 输入法上屏：`sendTextEvent` 在 VTE 中不生效，改为内置 `droiddesk-x11-type`（XTest）；ASCII 走 keysym + 必要时 Shift，中文等非 Latin-1 字符映射为 Unicode keysym（`0x01000000 | codepoint`）后由 XTest 按下，候选词提交可真正进入终端

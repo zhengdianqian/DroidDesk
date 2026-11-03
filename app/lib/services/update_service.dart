@@ -57,6 +57,9 @@ class UpdateService {
     } on HttpException catch (error) {
       // Rate limiting must never nag the user with popups, manual or not.
       if (error.message.contains('403') || error.message.contains('429')) {
+        // Record the attempt even when rate limited: otherwise every launch retried
+        // immediately and kept the API blocked.
+        await prefs.setInt(_lastCheckKey, DateTime.now().millisecondsSinceEpoch);
         return null;
       }
       if (manual) rethrow;
@@ -86,17 +89,25 @@ class UpdateService {
     );
   }
 
-  /// Prefers the arm64 asset (`DroidDesk-v1.4.0-arm64.apk`), falls back to any APK.
+  /// Picks the arm64 release APK. Debug, unsigned, x86 and 32-bit builds are rejected:
+  /// installing one over the signed arm64 app either fails verification or replaces it
+  /// with a build that cannot run. Returns null when no suitable asset exists.
   static Map? _pickApk(List<Map> assets) {
     final apks = assets
         .where((asset) => asset['name'].toString().toLowerCase().endsWith('.apk'))
         .toList();
-    if (apks.isEmpty) return null;
     for (final asset in apks) {
       final name = asset['name'].toString().toLowerCase();
+      if (name.contains('debug') ||
+          name.contains('unsigned') ||
+          name.contains('x86') ||
+          name.contains('armeabi-v7a') ||
+          name.contains('armv7')) {
+        continue;
+      }
       if (name.contains('arm64') || name.contains('aarch64')) return asset;
     }
-    return apks.first;
+    return null;
   }
 
   static Future<void> skip(String tag) async {
@@ -126,7 +137,16 @@ class UpdateService {
   static String _clean(String version) =>
       version.trim().replaceFirst(RegExp(r'^[vV]'), '').split(RegExp(r'[-+ ]')).first;
 
-  /// True when [candidate] is a higher semantic version than [current].
+  /// Build number from `1.4.5+14` (or `1.4.5-14`); 0 when the version carries none.
+  static int _build(String version) {
+    final match = RegExp(r'[+-](\d+)$').firstMatch(version.trim());
+    return match == null ? 0 : (int.tryParse(match.group(1)!) ?? 0);
+  }
+
+  /// True when [candidate] is a higher version than [current].
+  ///
+  /// The build number is compared too: two releases can share a versionName, and a
+  /// patch build with the same name was previously ignored, so users never received it.
   static bool isNewer(String candidate, String current) {
     List<int> parts(String v) =>
         _clean(v).split('.').map((p) => int.tryParse(p) ?? 0).toList();
@@ -137,6 +157,6 @@ class UpdateService {
       final y = i < b.length ? b[i] : 0;
       if (x != y) return x > y;
     }
-    return false;
+    return _build(candidate) > _build(current);
   }
 }

@@ -467,11 +467,13 @@ class AppState extends ChangeNotifier {
     return ok;
   }
 
-  Future<bool> applyBestMirror() async {
+  /// Returns a structured result code from the platform layer
+  /// (`Ok` / `NoNetwork` / `AptFailed` / `Unsupported`).
+  Future<String> applyBestMirror() async {
     try {
       return await DroidDeskPlatform.applyBestMirror();
     } catch (_) {
-      return false;
+      return 'Unsupported';
     }
   }
 
@@ -684,7 +686,11 @@ class AppState extends ChangeNotifier {
     if (_appVersion.isEmpty) {
       try {
         final info = await DroidDeskPlatform.getAppVersion();
-        _appVersion = info['versionName']?.toString() ?? '';
+        final name = info['versionName']?.toString() ?? '';
+        // Include the build number: two releases can share a versionName, and
+        // comparing names alone made patch builds invisible to the updater.
+        final code = info['versionCode'];
+        _appVersion = (code == null || code.toString().isEmpty) ? name : '$name+$code';
       } catch (_) {}
     }
     return _appVersion;

@@ -89,6 +89,7 @@ class DesktopActivity : Activity() {
     private var imePollThread: Thread? = null
     @Volatile private var imePolling = false
     private var lastImeFocus: String? = null
+    private var imeTapSeq: Int = 0
     private var loadingOverlay: FrameLayout? = null
     private var loadingStatus: TextView? = null
     private var loadingEstimate: TextView? = null
@@ -97,6 +98,9 @@ class DesktopActivity : Activity() {
     private var loadingFailureScroll: ScrollView? = null
     private var loadingFailureActions: LinearLayout? = null
     private var desktopRevealed = false
+
+    /** Uptime at which the desktop became visible; used to mute startup focus events. */
+    @Volatile private var desktopRevealedAt = 0L
     @Volatile private var sessionPhase = "准备中"
     @Volatile private var sessionStartInFlight = false
     private val activityStartedAt = System.currentTimeMillis()
@@ -162,7 +166,31 @@ class DesktopActivity : Activity() {
         fun finishIfOpen() {
             current?.get()?.let { activity -> activity.runOnUiThread { activity.finish() } }
         }
+
+        /**
+         * Finishes the desktop screen and waits until its `onDestroy` really ran.
+         *
+         * A resolution switch cannot restart the X server while DesktopActivity still holds
+         * its X11 service binding: `stopService` does not destroy a bound service, so the old
+         * framebuffer survived every change and only a manual app restart looked correct.
+         * onDestroy unbinds first, which lets the service die. The wait is bounded so a
+         * wedged activity never blocks the caller forever.
+         */
+        fun teardownAndAwait(timeoutMs: Long = 3_000): Boolean {
+            val activity = current?.get() ?: return true
+            val latch = activity.destroyLatch
+            activity.runOnUiThread { activity.finishAndRemoveTask() }
+            return try {
+                latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+        }
     }
+
+    /** Counted down at the end of onDestroy so teardown callers can wait for the unbind. */
+    private val destroyLatch = java.util.concurrent.CountDownLatch(1)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -175,7 +203,12 @@ class DesktopActivity : Activity() {
         estimatedLoadingSeconds = if (shouldStartSession) 30 else 10
 
         requestWindowFeature(Window.FEATURE_NO_TITLE)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Power first: the desktop must follow the system screen timeout unless the user
+        // explicitly opted into keeping the screen awake. The old unconditional flag kept
+        // the panel lit for the whole session, which is the largest battery cost of the app.
+        if (DisplayProfile.keepScreenOn(this)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
 
         placeholder = FrameLayout(this)
         placeholder.setBackgroundColor(Color.BLACK)
@@ -211,6 +244,9 @@ class DesktopActivity : Activity() {
     override fun onResume() {
         super.onResume()
         enableImmersiveMode()
+        if (DisplayProfile.keepScreenOn(this)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         restartSessionIfStopped()
     }
 
@@ -289,6 +325,8 @@ class DesktopActivity : Activity() {
 
     override fun onPause() {
         clipboardSync?.stop()
+        // Never hold the panel awake from the background.
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onPause()
     }
 
@@ -443,7 +481,11 @@ class DesktopActivity : Activity() {
 
     private fun attachDesktopInput() {
         if (inputController == null) {
-            inputController = X11InputController(lorieView!!, onThreeFingerTap = ::toggleKeyboard)
+            inputController = X11InputController(
+                lorieView!!,
+                onThreeFingerTap = ::toggleKeyboard,
+                onTapUp = ::armImeFromTap,
+            )
         }
         addDesktopControls()
         lorieView?.requestFocus()
@@ -463,8 +505,9 @@ class DesktopActivity : Activity() {
     private fun startAutoImePolling() {
         if (!DisplayProfile.autoIme(this) || imePollThread != null) return
         imePolling = true
+        resetImeBridgeState()
         imePollThread = Thread({
-            val focusFile = File(filesDir, "guest-bridge/ime-focus")
+            val focusFile = imeFocusFile()
             while (imePolling && !Thread.currentThread().isInterrupted) {
                 val value = runCatching {
                     if (focusFile.exists()) focusFile.readText().trim() else null
@@ -472,6 +515,15 @@ class DesktopActivity : Activity() {
                 if (value != null && value != lastImeFocus && (value == "0" || value == "1")) {
                     lastImeFocus = value
                     DesktopLog.event(this, "IMEBRIDGE", "editable focus=$value", activityStartedAt)
+                    // The first seconds after the desktop appears are exactly when xfwm4
+                    // gives a window focus on its own; opening the keyboard there was the
+                    // "keyboard pops up at launch" bug. Record it, do not act on it.
+                    if (value == "1" && desktopRevealedAt != 0L &&
+                        SystemClock.elapsedRealtime() - desktopRevealedAt < 3000
+                    ) {
+                        DesktopLog.event(this, "IMEBRIDGE", "startup focus ignored", activityStartedAt)
+                        continue
+                    }
                     runOnUiThread {
                         if (value == "1") showKeyboard() else hideKeyboard()
                     }
@@ -484,6 +536,48 @@ class DesktopActivity : Activity() {
             }
         }, "DroidDeskAutoIme").apply { isDaemon = true }
         imePollThread?.start()
+    }
+
+    private fun imeFocusFile(): File = File(filesDir, "guest-bridge/ime-focus")
+
+    private fun imeTapFile(): File = File(filesDir, "guest-bridge/ime-tap")
+
+    /**
+     * The guest watcher and this side share two files. `ime-focus` is the 0/1 state it
+     * reports; `ime-tap` is a per-touch counter this side bumps. A previous session can
+     * leave `ime-focus` at 1, which used to pop the keyboard the moment the desktop
+     * appeared, so both files are reset before a session starts and the poller starts
+     * from a known 0.
+     */
+    private fun resetImeBridgeState() {
+        lastImeFocus = "0"
+        imeTapSeq = 0
+        runCatching {
+            File(filesDir, "guest-bridge").mkdirs()
+            imeFocusFile().writeText("0\n")
+            imeTapFile().writeText("")
+        }.onFailure {
+            DesktopLog.append(this, "IMEBRIDGE", "reset failed: ${it.message}")
+        }
+    }
+
+    /**
+     * Called for every ACTION_DOWN on the X surface. The guest watcher only reports
+     * "editable" after seeing this counter change, which is what keeps a cold start
+     * (window focus without a tap) from opening the keyboard. A second tap inside an
+     * already-focused window does not change `ime-focus`, so it re-requests the
+     * keyboard directly once the watcher had time to re-evaluate.
+     */
+    private fun armImeFromTap() {
+        imeTapSeq += 1
+        runCatching { imeTapFile().writeText("$imeTapSeq\n") }
+        if (!DisplayProfile.autoIme(this)) return
+        val view = lorieView ?: return
+        view.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            val state = runCatching { imeFocusFile().readText().trim() }.getOrNull()
+            if (state == "1") showKeyboard()
+        }, 500)
     }
 
     private fun addDesktopControls() {
@@ -770,6 +864,10 @@ class DesktopActivity : Activity() {
     }
 
     private fun hideKeyboard() {
+        // Reset the shared state as well: the guest watcher writes `ime-focus` only when its
+        // own state changes, so a stale 1 would otherwise keep the next tap from re-showing.
+        lastImeFocus = "0"
+        runCatching { imeFocusFile().writeText("0\n") }
         val anchor = imeAnchor
         val inputMethod = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         inputMethod.hideSoftInputFromWindow((anchor ?: lorieView)?.windowToken, 0)
@@ -782,19 +880,38 @@ class DesktopActivity : Activity() {
         lorieView?.requestFocus()
     }
 
+    private fun isImeVisible(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
+        } else {
+            extraKeysBar?.visibility == View.VISIBLE
+        }
+
     /**
      * Pops the real Android input method (not an in-app keyboard window) by focusing the
      * hidden 1x1 anchor. The IME's commits are forwarded to X11 as text, so Chinese input
      * only hits the desktop once, on commit.
+     *
+     * Idempotent on purpose: several triggers (tap detection, the guest focus watcher, the
+     * toolbar button) can race, and a second show request while the keyboard is up used to
+     * restart the IME and drop the composing text.
      */
     private fun showKeyboard() {
+        if (isImeVisible()) return
         val anchor = imeAnchor ?: lorieView ?: return
         val inputMethod = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        // Clear + re-request instead of restartInput(): an IME dismissed while the anchor
+        // still held focus ignores showSoftInput, but accepts it after a fresh focus cycle.
+        anchor.clearFocus()
         anchor.requestFocus()
-        inputMethod.restartInput(anchor)
         anchor.post {
-            if (isFinishing || isDestroyed) return@post
-            inputMethod.showSoftInput(anchor, InputMethodManager.SHOW_IMPLICIT)
+            if (isFinishing || isDestroyed || isImeVisible()) return@post
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.insetsController?.show(WindowInsets.Type.ime())
+            } else {
+                @Suppress("DEPRECATION")
+                inputMethod.showSoftInput(anchor, InputMethodManager.SHOW_FORCED)
+            }
         }
     }
 
@@ -1164,6 +1281,7 @@ class DesktopActivity : Activity() {
         runOnUiThread {
             if (desktopRevealed || isFinishing || isDestroyed) return@runOnUiThread
             desktopRevealed = true
+            desktopRevealedAt = SystemClock.elapsedRealtime()
             loadingMessageHandler.removeCallbacks(loadingMessageTicker)
             loadingMessageHandler.removeCallbacks(loadingEstimateTicker)
             loadingCancel?.visibility = View.GONE
@@ -1342,6 +1460,9 @@ class DesktopActivity : Activity() {
         intentListenerThread = null
         if (current?.get() === this) current = null
         super.onDestroy()
+        // Released last: the binding is gone at this point, which is what lets a
+        // resolution switch stop the :x11 process.
+        destroyLatch.countDown()
     }
 }
 
@@ -1381,6 +1502,21 @@ private class GuestImeAnchor(
             // path subtracts what was already mirrored instead of retyping it.
             private var composing = ""
 
+            /** Backspace deletes one codepoint, while String.length counts UTF-16 units. */
+            private fun codePoints(value: String): Int =
+                if (value.isEmpty()) 0 else value.codePointCount(0, value.length)
+
+            private fun codePointList(value: String): List<Int> {
+                val out = ArrayList<Int>(value.length)
+                var index = 0
+                while (index < value.length) {
+                    val cp = value.codePointAt(index)
+                    out.add(cp)
+                    index += Character.charCount(cp)
+                }
+                return out
+            }
+
             private fun commitToX(text: CharSequence?, replaced: Int = 0): Boolean {
                 val value = text?.toString().orEmpty()
                 if (value.isNotEmpty()) {
@@ -1396,7 +1532,7 @@ private class GuestImeAnchor(
                     DesktopLog.append(
                         ctx,
                         "IMEBRIDGE",
-                        "commit ${value.length} chars, replaced $replaced preview chars",
+                        "commit ${codePoints(value)} chars, replaced $replaced preview chars",
                     )
                 }
                 return true
@@ -1416,10 +1552,10 @@ private class GuestImeAnchor(
                 var replaced = 0
                 if (mirrored.isNotEmpty()) {
                     // The IME changed the word between preview and commit. Delete exactly
-                    // the mirrored characters: an arbitrary cap would leave the tail of a
+                    // the mirrored codepoints: an arbitrary cap would leave the tail of a
                     // long pinyin preview behind and then type the final text after it.
-                    replaced = mirrored.length
-                    deleteText(replaced)
+                    replaced = codePoints(mirrored)
+                    if (replaced > 0) deleteText(replaced)
                 }
                 return commitToX(value, replaced)
             }
@@ -1436,17 +1572,22 @@ private class GuestImeAnchor(
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 // Mirror the composing text so terminals and GTK entries show what the
                 // user is typing (including the pinyin preview) before it is committed.
+                // The diff is computed in codepoints: comparing UTF-16 units split emoji
+                // surrogates and produced one extra backspace per astral character.
                 val next = text?.toString().orEmpty()
                 val previous = composing
+                val prevCps = codePointList(previous)
+                val nextCps = codePointList(next)
                 var common = 0
-                while (common < previous.length && common < next.length &&
-                    previous[common] == next[common]
+                while (common < prevCps.size && common < nextCps.size &&
+                    prevCps[common] == nextCps[common]
                 ) {
                     common++
                 }
-                val removed = previous.length - common
+                val removed = prevCps.size - common
                 if (removed > 0) deleteText(removed)
-                val suffix = next.substring(common)
+                val suffixStart = if (common == 0) 0 else next.offsetByCodePoints(0, common)
+                val suffix = next.substring(suffixStart)
                 if (suffix.isNotEmpty()) {
                     typeText(suffix)
                 }
@@ -1455,14 +1596,33 @@ private class GuestImeAnchor(
             }
 
             override fun finishComposingText(): Boolean {
+                // The pinyin preview was already mirrored to X. Clearing `composing` without
+                // removing it left the preview on screen while the IME considered the
+                // composition gone, so the next commit typed the word a second time.
+                val preview = composing
                 composing = ""
+                val previewLength = codePoints(preview)
+                if (previewLength > 0) deleteText(previewLength)
                 return true
             }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                deleteText(beforeLength.coerceAtMost(16))
+                // Only text this bridge mirrored may be deleted. Removing real text from
+                // the X buffer here made `commitText` subtract it a second time.
+                val available = codePoints(composing)
+                val remove = beforeLength.coerceAtLeast(0).coerceAtMost(available)
+                if (remove > 0) {
+                    deleteText(remove)
+                    val cut = composing.offsetByCodePoints(0, available - remove)
+                    composing = composing.substring(0, cut)
+                }
                 return true
             }
+
+            override fun deleteSurroundingTextInCodePoints(
+                beforeLength: Int,
+                afterLength: Int,
+            ): Boolean = deleteSurroundingText(beforeLength, afterLength)
 
             override fun sendKeyEvent(event: KeyEvent?): Boolean {
                 if (event != null && event.action == KeyEvent.ACTION_DOWN) {

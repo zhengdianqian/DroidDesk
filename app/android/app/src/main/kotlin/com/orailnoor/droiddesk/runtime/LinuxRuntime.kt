@@ -142,6 +142,14 @@ class LinuxRuntime(private val context: Context) {
         val script = buildString {
             leftovers.forEach { append("pkill -9 -x '$it' >/dev/null 2>&1 || true\n") }
             append("pkill -9 -f 'android_intent_pipe' >/dev/null 2>&1 || true\n")
+            // Stale watchers are worse than leftover apps: an old ime-watch keeps its own
+            // ARMED/LAST state and rewrites ime-focus to 1 across the next session, which
+            // is one of the sources of the keyboard opening at launch. Selection helpers
+            // linger the same way and would answer clipboard reads with dead content.
+            append("pkill -9 -f 'ime-watch' >/dev/null 2>&1 || true\n")
+            append("pkill -9 -f 'droiddesk-x11-focus' >/dev/null 2>&1 || true\n")
+            append("pkill -9 -x xclip >/dev/null 2>&1 || true\n")
+            append("pkill -9 -x xsel >/dev/null 2>&1 || true\n")
             append("rm -f \"${tmpDir.absolutePath}/dbus-session\"\n")
             append("rm -f \"${tmpDir.absolutePath}\"/.xfsm-ICE-* 2>/dev/null || true\n")
         }
@@ -1276,8 +1284,15 @@ class LinuxRuntime(private val context: Context) {
             #include <unistd.h>
 
             static Display *dpy = NULL;
-            static int spare_kc = 0;
             static int shift_kc = 0;
+            /* Spare keycodes are claimed for the duration of one string, remapped once
+               with a single XSync + wait, then restored. Never overwrite keycode 255:
+               a hard fallback would clobber a real key on keyboards that use it. */
+            #define MAX_SPARES 96
+            #define MAX_TEXT 1024
+            static KeyCode spares[MAX_SPARES];
+            static int spare_count = 0;
+            static int spare_used = 0;
 
             static void tap(int kc, int shift) {
                 if (shift && shift_kc) XTestFakeKeyEvent(dpy, shift_kc, True, CurrentTime);
@@ -1288,55 +1303,124 @@ class LinuxRuntime(private val context: Context) {
                 usleep(8000);
             }
 
-            static int find_spare_keycode(void) {
+            static void collect_spares(void) {
                 int min_kc = 0, max_kc = 0, per = 0;
                 XDisplayKeycodes(dpy, &min_kc, &max_kc);
                 KeySym *map = XGetKeyboardMapping(dpy, min_kc, max_kc - min_kc + 1, &per);
-                if (!map) return 0;
-                int found = 0;
-                for (int kc = max_kc; kc >= min_kc && found == 0; kc--) {
+                if (!map) return;
+                spare_count = 0;
+                for (int kc = min_kc; kc <= max_kc && spare_count < MAX_SPARES; kc++) {
                     int free_slot = 1;
                     for (int j = 0; j < per; j++) {
                         if (map[(kc - min_kc) * per + j] != NoSymbol) { free_slot = 0; break; }
                     }
-                    if (free_slot) found = kc;
+                    if (free_slot) spares[spare_count++] = kc;
                 }
                 XFree(map);
-                return found;
             }
 
-            static void send_keysym(KeySym ks) {
+            /* Returns the keycode when the keysym is already reachable, else 0. */
+            static int lookup_key(KeySym ks, int *shift) {
                 KeyCode kc = XKeysymToKeycode(dpy, ks);
-                int usable = 0, shift = 0;
-                if (kc) {
-                    int per = 0;
-                    KeySym *map = XGetKeyboardMapping(dpy, kc, 1, &per);
-                    if (map) {
-                        if (per > 0 && map[0] == ks) { usable = 1; shift = 0; }
-                        else if (per > 1 && map[1] == ks) { usable = 1; shift = 1; }
-                        XFree(map);
-                    }
-                }
-                if (usable) { tap(kc, shift); return; }
-                KeySym syms[2];
-                syms[0] = ks;
-                syms[1] = ks;
-                XChangeKeyboardMapping(dpy, spare_kc, 2, syms, 1);
-                XSync(dpy, False);
-                /* Clients (GTK/VTE) only see the new keysym after they process
-                   MappingNotify. Give them a full frame before pressing, otherwise
-                   the previous character repeats on screen. */
-                usleep(120000);
-                tap(spare_kc, 0);
-                usleep(30000);
+                int per = 0;
+                if (!kc) return 0;
+                KeySym *map = XGetKeyboardMapping(dpy, kc, 1, &per);
+                if (!map) return 0;
+                int result = 0;
+                if (per > 0 && map[0] == ks) { *shift = 0; result = kc; }
+                else if (per > 1 && map[1] == ks) { *shift = 1; result = kc; }
+                XFree(map);
+                return result;
             }
 
-            static void send_codepoint(unsigned cp) {
-                if (cp == '\n' || cp == '\r') { send_keysym(XK_Return); return; }
-                if (cp == '\t') { send_keysym(XK_Tab); return; }
-                if (cp == 8 || cp == 127) { send_keysym(XK_BackSpace); return; }
-                if (cp >= 0x20 && cp <= 0x7e) { send_keysym((KeySym)cp); return; }
-                send_keysym((KeySym)(0x01000000u | cp));
+            static KeySym keysym_for(unsigned cp) {
+                if (cp == '\n' || cp == '\r') return XK_Return;
+                if (cp == '\t') return XK_Tab;
+                if (cp == 8 || cp == 127) return XK_BackSpace;
+                if (cp >= 0x20 && cp <= 0x7e) return (KeySym)cp;
+                return (KeySym)(0x01000000u | cp);
+            }
+
+            static int utf8_to_codepoints(const char *text, unsigned *out, int max) {
+                const unsigned char *p = (const unsigned char *)text;
+                int n = 0;
+                while (*p && n < max) {
+                    unsigned cp = 0;
+                    if (*p < 0x80) {
+                        cp = *p++;
+                    } else if ((*p & 0xE0) == 0xC0 && p[1]) {
+                        cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+                        p += 2;
+                    } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+                        cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+                        p += 3;
+                    } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
+                        cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) |
+                             ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+                        p += 4;
+                    } else {
+                        p++;
+                        continue;
+                    }
+                    out[n++] = cp;
+                }
+                return n;
+            }
+
+            static int send_text(const char *text) {
+                unsigned cps[MAX_TEXT];
+                int n = utf8_to_codepoints(text, cps, MAX_TEXT);
+                KeyCode plan[MAX_TEXT];
+                int plan_shift[MAX_TEXT];
+                spare_used = 0;
+                /* Pass 1: decide which characters can ride an existing key and which
+                   need a temporary mapping. All remaps are queued before the single
+                   XSync so a long Chinese commit costs one wait, not one per glyph. */
+                for (int i = 0; i < n; i++) {
+                    KeySym ks = keysym_for(cps[i]);
+                    int shift = 0;
+                    int kc = lookup_key(ks, &shift);
+                    if (kc) {
+                        plan[i] = kc;
+                        plan_shift[i] = shift;
+                        continue;
+                    }
+                    if (spare_used >= spare_count) {
+                        fprintf(stderr, "no spare keycode for U+%04X (%d spares)\n", cps[i], spare_count);
+                        /* Restore the keys already claimed before giving up, otherwise
+                           every failed commit leaks mappings for the whole session. */
+                        if (spare_used > 0) {
+                            KeySym none[2] = { NoSymbol, NoSymbol };
+                            for (int j = 0; j < spare_used; j++) {
+                                XChangeKeyboardMapping(dpy, spares[j], 2, none, 1);
+                            }
+                            XSync(dpy, False);
+                        }
+                        return 5;
+                    }
+                    KeyCode spare = spares[spare_used++];
+                    KeySym syms[2] = { ks, ks };
+                    XChangeKeyboardMapping(dpy, spare, 2, syms, 1);
+                    plan[i] = spare;
+                    plan_shift[i] = 0;
+                }
+                if (spare_used > 0) {
+                    XSync(dpy, False);
+                    /* Clients (GTK/VTE) only see a new keysym after processing
+                       MappingNotify; wait one frame for the whole batch. */
+                    usleep(150000);
+                }
+                for (int i = 0; i < n; i++) {
+                    tap(plan[i], plan_shift[i]);
+                }
+                if (spare_used > 0) {
+                    KeySym none[2] = { NoSymbol, NoSymbol };
+                    for (int i = 0; i < spare_used; i++) {
+                        XChangeKeyboardMapping(dpy, spares[i], 2, none, 1);
+                    }
+                    XSync(dpy, False);
+                }
+                return 0;
             }
 
             int main(int argc, char **argv) {
@@ -1353,38 +1437,26 @@ class LinuxRuntime(private val context: Context) {
                     return 4;
                 }
                 shift_kc = XKeysymToKeycode(dpy, XK_Shift_L);
-                spare_kc = find_spare_keycode();
-                if (!spare_kc) spare_kc = 255;
+                collect_spares();
+                if (spare_count == 0) {
+                    fprintf(stderr, "no free keycode available\n");
+                    XCloseDisplay(dpy);
+                    return 5;
+                }
 
                 const char *mode = argv[1];
+                int result = 0;
                 if (strcmp(mode, "--type") == 0 && argc > 2) {
-                    const unsigned char *p = (const unsigned char *)argv[2];
-                    while (*p) {
-                        unsigned cp = 0;
-                        if (*p < 0x80) {
-                            cp = *p++;
-                        } else if ((*p & 0xE0) == 0xC0 && p[1]) {
-                            cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
-                            p += 2;
-                        } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
-                            cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
-                            p += 3;
-                        } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
-                            cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) |
-                                 ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
-                            p += 4;
-                        } else {
-                            p++;
-                            continue;
-                        }
-                        send_codepoint(cp);
-                    }
+                    result = send_text(argv[2]);
+                    if (result != 0) { XCloseDisplay(dpy); return result; }
                 } else if (strcmp(mode, "--backspace") == 0) {
                     int n = (argc > 2) ? atoi(argv[2]) : 1;
-                    for (int i = 0; i < n; i++) send_keysym(XK_BackSpace);
+                    KeyCode kc = XKeysymToKeycode(dpy, XK_BackSpace);
+                    for (int i = 0; i < n; i++) tap(kc, 0);
                 } else if (strcmp(mode, "--return") == 0) {
                     int n = (argc > 2) ? atoi(argv[2]) : 1;
-                    for (int i = 0; i < n; i++) send_keysym(XK_Return);
+                    KeyCode kc = XKeysymToKeycode(dpy, XK_Return);
+                    for (int i = 0; i < n; i++) tap(kc, 0);
                 } else {
                     fprintf(stderr, "unknown mode\n");
                     XCloseDisplay(dpy);
@@ -1513,6 +1585,23 @@ class LinuxRuntime(private val context: Context) {
                 if (aptConf.exists() && aptConf.delete()) {
                     DesktopLog.append(context, TAG, "store proxy config removed (proxy down)")
                 }
+                // The apt conf alone is not enough: shells (and apt started from a
+                // terminal or xfce) read http_proxy from .bashrc. A dead proxy left
+                // there kept overriding a working direct connection, which is why
+                // `apt-get update` failed on every mirror even after the proxy died.
+                if (bashrc.exists()) {
+                    val current = bashrc.readText()
+                    if (current.contains(marker)) {
+                        val cleaned = current.replace(
+                            Regex(
+                                Regex.escape(marker) + "[\\s\\S]*?export no_proxy=[^\\n]*\\n?",
+                            ),
+                            "",
+                        )
+                        bashrc.writeText(cleaned)
+                        DesktopLog.append(context, TAG, "store proxy block removed from .bashrc")
+                    }
+                }
             }
             return
         }
@@ -1571,6 +1660,17 @@ class LinuxRuntime(private val context: Context) {
                 appendLine("export DPKG_ADMINDIR=${prefixDir.absolutePath}/var/lib/dpkg")
                 appendLine("export TMPDIR=${tmpDir.absolutePath}")
                 appendLine("export PATH=${prefixDir.absolutePath}/bin:\$PATH")
+                // The socket/path hook must be active in every shell: apt and dpkg were
+                // built against /data/data/com.termux/files/usr, which does not exist for
+                // this app. Kotlin passes LD_PRELOAD only to processes it spawns, so apt
+                // started from a terminal or from the xfce panel fell back to the literal
+                // prefix and died with "Permission denied". Keep any existing value.
+                appendLine("if [ -f \"\$PREFIX/lib/libsocket_hook.so\" ]; then")
+                appendLine("  case \":\$LD_PRELOAD:\" in")
+                appendLine("    *:libsocket_hook.so:*) ;;")
+                appendLine("    *) export LD_PRELOAD=\"\$PREFIX/lib/libsocket_hook.so\${LD_PRELOAD:+:\$LD_PRELOAD}\" ;;")
+                appendLine("  esac")
+                appendLine("fi")
                 append(endMarker)
                 appendLine()
             }
@@ -1618,6 +1718,129 @@ class LinuxRuntime(private val context: Context) {
     }
 
     // ── Environment Configuration ──
+
+    private fun t(zh: String, en: String): String = L10n.tr(context, zh, en)
+
+    /** Termux apt repositories served from domestic mirrors. */
+    private val TERMUX_MIRRORS = listOf(
+        "https://mirrors.tuna.tsinghua.edu.cn/termux/apt/apt-main",
+        "https://mirrors.ustc.edu.cn/termux/apt/apt-main",
+        "https://mirrors.aliyun.com/termux/apt/apt-main",
+    )
+
+    /**
+     * Rewrite the Termux sources and refresh the index, returning a structured code
+     * (Ok / NoNetwork / AptFailed / Unsupported).
+     *
+     * The native runtime (no root) previously returned a bare false, which the UI turned
+     * into "no usable mirror" even when the network was perfectly fine. Now the mirror is
+     * actually written and apt decides; only a real failure is reported.
+     */
+    fun applyTermuxMirror(onLog: (String) -> Unit = {}): String {
+        val aptGet = File(prefixDir, "bin/apt-get")
+        if (!aptGet.exists()) return "Unsupported"
+        val sources = File(prefixDir, "etc/apt/sources.list")
+        runCatching {
+            sources.parentFile?.mkdirs()
+            val backup = File(prefixDir, "etc/apt/sources.list.droiddesk-before-mirror")
+            if (sources.exists() && !backup.exists()) sources.copyTo(backup, overwrite = false)
+        }
+        var lastExit = -1
+        for (base in TERMUX_MIRRORS) {
+            runCatching {
+                sources.writeText("# DroidDesk termux mirror\n# droiddesk-store-mirror\ndeb $base stable main\n")
+            }.onFailure {
+                DesktopLog.append(context, TAG, "termux mirror write failed: ${it.message}")
+                return "AptFailed"
+            }
+            onLog(t("已写入 Termux 镜像 $base，正在刷新索引…\n", "Termux mirror $base written; refreshing index...\n"))
+            lastExit = runTermuxCommand("DEBIAN_FRONTEND=noninteractive apt-get update -o Dpkg::Use-Pty=0")
+            if (lastExit == 0) {
+                onLog(t("软件源已切换到 $base\n", "APT mirror switched to $base\n"))
+                return "Ok"
+            }
+        }
+        return when (lastExit) {
+            127, -1 -> "NoNetwork"
+            0 -> "Ok"
+            else -> "AptFailed"
+        }
+    }
+
+    /** Runs a command in the guest shell and returns its exit code (-1 when it cannot start). */
+    private fun runTermuxCommand(command: String): Int {
+        return try {
+            val process = ProcessBuilder("${prefixDir.absolutePath}/bin/sh", "-c", command)
+                .directory(homeDir)
+                .apply { environment().putAll(getTermuxEnv()) }
+                .redirectErrorStream(true)
+                .start()
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line -> if (line.isNotBlank()) Log.i(TAG, "apt: $line") }
+            }
+            if (!process.waitFor(90, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                -1
+            } else {
+                process.exitValue()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "runTermuxCommand failed: ${e.message}")
+            -1
+        }
+    }
+
+    /**
+     * Write $PREFIX/etc/resolv.conf and pin mirror hostnames into $PREFIX/etc/hosts.
+     *
+     * The native runtime never wrote a resolver file (only the chroot did), so apt inside
+     * the guest inherited whatever the bootstrap shipped and every DNS lookup failed.
+     * Resolution itself happens on the Android side, where the app's own DNS works, and
+     * the pinned IPs keep apt usable even if in-guest DNS stays broken.
+     */
+    private fun ensureGuestDns() {
+        runCatching {
+            val etc = File(prefixDir, "etc").apply { mkdirs() }
+            val resolv = File(etc, "resolv.conf")
+            resolv.delete()
+            val servers = DnsConfig.FALLBACK_DNS.take(3)
+            resolv.writeText(
+                buildString {
+                    servers.forEach { append("nameserver $it\n") }
+                    append("options timeout:2 attempts:3\n")
+                },
+            )
+            val pins = mutableListOf<String>()
+            (MirrorSelector.MIRROR_HOSTS + TERMUX_MIRRORS.mapNotNull {
+                runCatching { java.net.URI(it).host }.getOrNull()
+            }).distinct().forEach { host ->
+                runCatching {
+                    java.net.InetAddress.getAllByName(host)
+                        .mapNotNull { it.hostAddress }
+                        .filter { address -> address.contains('.') }
+                        .forEach { address -> pins.add("$address $host") }
+                }
+            }
+            val content = buildString {
+                appendLine("127.0.0.1   localhost")
+                appendLine("127.0.0.1   droiddesk")
+                appendLine("::1         localhost ip6-localhost ip6-loopback")
+                if (pins.isNotEmpty()) {
+                    appendLine("# droiddesk-pin (mirror IPs resolved on Android)")
+                    pins.forEach { appendLine(it) }
+                }
+            }
+            File(etc, "hosts").writeText(content)
+            DesktopLog.append(
+                context,
+                TAG,
+                "guest resolv.conf written (${servers.joinToString(",")}), pinned ${pins.size} mirror IPs",
+            )
+        }.onFailure {
+            DesktopLog.append(context, TAG, "guest DNS setup failed: ${it.message}")
+        }
+    }
+
 
     private fun getTermuxEnv(): Map<String, String> {
         val env = mutableMapOf<String, String>()
@@ -2637,6 +2860,11 @@ class LinuxRuntime(private val context: Context) {
                     homeDir,
                     ".local/share/backgrounds/droiddesk-ubuntu-touch.jpg",
                 ),
+                // Passing the user's scale and power mode matters: XfceMobileProfile
+                // defaults to 1.5/standard, so without them choosing "saver" in the UI
+                // still installed animations and the compositor.
+                uiScale = DisplayProfile.uiScale(context),
+                powerMode = DisplayProfile.powerMode(context),
             )
             mark("profile:end")
             exportDesktopShortcuts()
@@ -2674,6 +2902,7 @@ class LinuxRuntime(private val context: Context) {
         mark("type-probe")
         ensureStoreProxyConfig()
         ensurePackageManagerEnv()
+        ensureGuestDns()
         mark("store-proxy")
         onPhase("启动会话总线")
 
@@ -2967,19 +3196,67 @@ DROIDDESK_SH
 #!/system/bin/sh
 BRIDGE="${'$'}{DROIDDESK_BRIDGE:-/tmp/droiddesk-bridge}"
 FOCUS="${'$'}BRIDGE/ime-focus"
+TAPFILE="${'$'}BRIDGE/ime-tap"
+ACTIVE="${'$'}BRIDGE/ime-active"
 LAST="none"
+LASTTAP=""
+LASTACTIVE=""
+# A window class alone is not proof that the user aimed at a text widget: xfce4
+# auto-focuses a window during startup, and every window click inside a whitelisted
+# app looks the same. Only report editable focus after a real touch landed on the
+# X surface (ime-tap is rewritten on each tap by the Android side), so a cold start
+# can never pop the keyboard. Tapping inside a whitelisted app keeps the arm; tapping
+# anywhere else clears it.
+#
+# Power: the expensive part is the focus probe (a full X client). It now runs only
+# when the active window or the tap token changes, never on a timer. The active
+# window is tracked by one long-lived `xprop -root -spy`, which replaces the old
+# probe-every-300ms loop (~12000 forked X clients per hour).
+ARMED=0
+SPY=0
+if command -v xprop >/dev/null 2>&1; then
+    SPY=1
+fi
+if [ "${'$'}SPY" = "1" ]; then
+    (
+        xprop -root -spy _NET_ACTIVE_WINDOW 2>/dev/null |
+        while IFS= read -r line; do
+            printf '%s\n' "${'$'}line" > "${'$'}ACTIVE" 2>/dev/null || true
+        done
+    ) &
+fi
 while true; do
-    cls="${'$'}("${'$'}{DROIDDESK_X11_FOCUS:-}" 2>/dev/null)"
-    case "${'$'}cls" in
-        *xfce4-terminal*|*zenity*|*Zenity*|*thunar*|*Thunar*|*mousepad*|*Mousepad*|\
+    tap=""
+    read -r tap < "${'$'}TAPFILE" 2>/dev/null || true
+    active=""
+    read -r active < "${'$'}ACTIVE" 2>/dev/null || true
+    probe=0
+    if [ -n "${'$'}tap" ] && [ "${'$'}tap" != "${'$'}LASTTAP" ]; then
+        LASTTAP="${'$'}tap"
+        ARMED=1
+        # Force one rewrite after every tap: the Android side resets ime-focus to 0
+        # when the keyboard is dismissed, and an unchanged LAST would otherwise keep
+        # the second tap in the same window from re-triggering the keyboard.
+        LAST="none"
+        probe=1
+    fi
+    if [ "${'$'}SPY" = "0" ] || { [ -n "${'$'}active" ] && [ "${'$'}active" != "${'$'}LASTACTIVE" ]; }; then
+        LASTACTIVE="${'$'}active"
+        probe=1
+    fi
+    if [ "${'$'}probe" = "1" ]; then
+        cls="${'$'}("${'$'}{DROIDDESK_X11_FOCUS:-}" 2>/dev/null)"
+        case "${'$'}cls" in
+            *xfce4-terminal*|*zenity*|*Zenity*|*mousepad*|*Mousepad*|\
 *xfce4-settings*|*Xfce4-settings*|*gedit*|*XTerm*|*xterm*|*urxvt*|*leafpad*|\
-*droiddesk*|*code-oss*|*Code*|*firefox*|*Chromium*|*libreoffice*)
-            state=1 ;;
-        *) state=0 ;;
-    esac
-    if [ "${'$'}LAST" != "${'$'}state" ]; then
-        LAST="${'$'}state"
-        printf '%s\n' "${'$'}state" > "${'$'}FOCUS" 2>/dev/null || true
+*droiddesk*|*code-oss*|*Code*)
+                if [ "${'$'}ARMED" = "1" ]; then state=1; else state=0; fi ;;
+            *) state=0; ARMED=0 ;;
+        esac
+        if [ "${'$'}LAST" != "${'$'}state" ]; then
+            LAST="${'$'}state"
+            printf '%s\n' "${'$'}state" > "${'$'}FOCUS" 2>/dev/null || true
+        fi
     fi
     sleep 0.3
 done
@@ -3050,28 +3327,54 @@ DROIDDESK_X11
             # "no editable focus" and the Android keyboard stops popping up. Verify the
             # WM once with a bounded loop and restart it a single time; no persistent
             # watchdog is installed, by design.
+            #
+            # _NET_SUPPORTING_WM_CHECK survives on the root window after the WM exits,
+            # so its mere presence proves nothing. Read the window id it points at and
+            # ask xprop about that window: when the WM is gone the id is dead and xprop
+            # fails, which is the only reliable "WM is gone" signal.
+            wm_alive() {
+                if command -v xprop >/dev/null 2>&1; then
+                    win=$(xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | awk '/window id #/ {print ${'$'}NF}')
+                    [ -n "${'$'}win" ] || return 1
+                    xprop -id "${'$'}win" _NET_WM_NAME 2>/dev/null | grep -q '_NET_WM_NAME'
+                    return ${'$'}?
+                fi
+                ps -A -o comm= 2>/dev/null | grep -qx xfwm4
+            }
             (
-                for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+                # Start counting only once the panel exists: that is the first moment a
+                # window manager is actually expected, so the window is much less likely
+                # to be missed on a slow cold boot. The overall cap is 40s.
+                i=0
+                while [ "${'$'}i" -lt 80 ]; do
                     sleep 0.5
-                    if command -v xprop >/dev/null 2>&1; then
-                        xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && exit 0
-                    else
-                        ps -A -o comm= 2>/dev/null | grep -qx xfwm4 && exit 0
+                    i=${'$'}((i + 1))
+                    if ps -A -o comm= 2>/dev/null | grep -qx xfce4-panel; then
+                        break
                     fi
                 done
-                echo "DIAG: xfwm4 not alive after 15s, restarting once"
-                (
-                    xfwm4 --replace --sm-client-disable 2>&1 | tee -a "${tmpDir.absolutePath}/droiddesk-xfwm4.log"
-                ) &
-                sleep 3
-                if command -v xprop >/dev/null 2>&1; then
-                    xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' \
-                        && echo "DIAG: xfwm4 recovered" \
-                        || echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                i=0
+                while [ "${'$'}i" -lt 80 ]; do
+                    wm_alive && break
+                    i=${'$'}((i + 1))
+                    sleep 0.5
+                done
+                if [ "${'$'}i" -lt 80 ]; then
+                    printf '1\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                    echo "DIAG: xfwm4 alive"
                 else
-                    ps -A -o comm= 2>/dev/null | grep -qx xfwm4 \
-                        && echo "DIAG: xfwm4 recovered" \
-                        || echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                    echo "DIAG: xfwm4 not alive after 40s, restarting once"
+                    (
+                        xfwm4 --replace --sm-client-disable 2>&1 | tee -a "${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                    ) &
+                    sleep 3
+                    if wm_alive; then
+                        printf '1\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                        echo "DIAG: xfwm4 recovered"
+                    else
+                        printf '0\n' > "${tmpDir.absolutePath}/droiddesk-bridge/wm-ok" 2>/dev/null || true
+                        echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                    fi
                 fi
             ) &
             exec $desktopCommand
@@ -3147,7 +3450,10 @@ DROIDDESK_X11
         "lxqt" -> listOf("lxqt-panel") to listOf("lxqt-session")
         "mate" -> listOf("mate-panel") to listOf("mate-session")
         "kde" -> listOf("plasmashell") to emptyList()
-        else -> listOf("xfce4-panel") to listOf("xfdesktop", "xfwm4")
+        // xfwm4 is no longer optional: without a window manager the desktop never hands
+        // keyboard focus to a widget, so revealing the surface would show a usable-looking
+        // desktop in which typing silently does nothing. xfdesktop stays optional.
+        else -> listOf("xfce4-panel", "xfwm4") to listOf("xfdesktop")
     }
 
     fun stopSession() {

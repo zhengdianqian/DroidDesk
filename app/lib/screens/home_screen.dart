@@ -852,17 +852,20 @@ class HomeScreen extends StatelessWidget {
                         subtitle: AppStrings.t('settings.apt.mirror.subtitle'),
                         onTap: () async {
                           Navigator.pop(sheetContext);
-                          final ok = await state.applyBestMirror();
+                          final code = await state.applyBestMirror();
                           if (!pageContext.mounted) return;
+                          // Distinct messages per failure kind: a broken device
+                          // resolver used to be shown as "no usable mirror".
+                          final messageKey = switch (code) {
+                            'Ok' => 'settings.apt.mirror.ok',
+                            'NoNetwork' => 'settings.apt.mirror.no_network',
+                            'AptFailed' => 'settings.apt.mirror.apt_failed',
+                            'ProbeInconclusive' => 'settings.apt.mirror.probe_inconclusive',
+                            _ => 'settings.apt.mirror.unsupported',
+                          };
                           ScaffoldMessenger.of(pageContext).showSnackBar(
                             SnackBar(
-                              content: Text(
-                                AppStrings.t(
-                                  ok
-                                      ? 'settings.apt.mirror.ok'
-                                      : 'settings.apt.mirror.failed',
-                                ),
-                              ),
+                              content: Text(AppStrings.t(messageKey)),
                             ),
                           );
                         },

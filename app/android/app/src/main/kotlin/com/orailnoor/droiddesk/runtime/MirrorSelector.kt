@@ -58,28 +58,49 @@ object MirrorSelector {
     }
 
     /**
-     * Probe every candidate mirror with a HEAD request against
+     * Probe every candidate mirror with a ranged GET against
      * <mirror>/dists/<codename>/Release using a 3 second timeout.
      * Returns the reachable mirrors in preference order (possibly empty).
+     *
+     * GET with `Range: bytes=0-0` instead of HEAD: several CDNs (and the host proxy)
+     * answer HEAD with 405/403, so HEAD-based probing reported a healthy mirror as
+     * unavailable and the UI then claimed there was no usable mirror at all.
      */
     fun probeReachable(codename: String): List<String> {
-        return CANDIDATES.filter { base ->
-            val probeUrl = "$base/dists/$codename/Release"
-            try {
-                val conn = URL(probeUrl).openConnection() as HttpURLConnection
-                conn.requestMethod = "HEAD"
-                conn.connectTimeout = PROBE_TIMEOUT_MS
-                conn.readTimeout = PROBE_TIMEOUT_MS
-                conn.instanceFollowRedirects = true
-                val code = conn.responseCode
-                conn.disconnect()
-                val reachable = code in 200..399
-                Log.i(TAG, "Mirror probe $probeUrl -> HTTP $code (reachable=$reachable)")
-                reachable
-            } catch (e: Exception) {
-                Log.i(TAG, "Mirror probe $probeUrl failed: ${e.javaClass.simpleName}: ${e.message}")
-                false
-            }
+        return CANDIDATES.filter { base -> probeOne(base, codename) }
+    }
+
+    private fun probeOne(base: String, codename: String): Boolean {
+        val probeUrl = "$base/dists/$codename/Release"
+        return try {
+            val conn = URL(probeUrl).openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Range", "bytes=0-0")
+            conn.connectTimeout = PROBE_TIMEOUT_MS
+            conn.readTimeout = PROBE_TIMEOUT_MS
+            conn.instanceFollowRedirects = true
+            val code = conn.responseCode
+            conn.disconnect()
+            // Any HTTP answer proves the host is reachable; only a network error means
+            // "cannot reach". A 404 is a mirror-layout problem, not an unreachable host.
+            val reachable = code != -1
+            Log.i(TAG, "Mirror probe $probeUrl -> HTTP $code (reachable=$reachable)")
+            reachable
+        } catch (e: Exception) {
+            Log.i(TAG, "Mirror probe $probeUrl failed: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    /** Coarse reachability used only to word error messages, never to block a switch. */
+    enum class Reachability { REACHABLE, PARTIAL, UNREACHABLE }
+
+    fun reachability(codename: String): Reachability {
+        val reachable = probeReachable(codename).size
+        return when {
+            reachable == 0 -> Reachability.UNREACHABLE
+            reachable == CANDIDATES.size -> Reachability.REACHABLE
+            else -> Reachability.PARTIAL
         }
     }
 
@@ -120,13 +141,28 @@ object MirrorSelector {
     }
 
     /**
-     * Convenience: pick the first reachable mirror and write it.
-     * Returns the chosen mirror base URL, or null when none is reachable.
+     * Candidate mirrors ordered by probe result, with every unprobed candidate kept
+     * as a fallback. A probe that fails (timeout, unresolvable host, proxy down) is
+     * NOT evidence that the mirror is gone: probes run on the Android side and fail
+     * as a group whenever the device resolver is broken. Callers must let apt-get
+     * update decide instead of reporting "no mirror available".
+     */
+    fun orderedCandidates(codename: String): List<String> {
+        val reachable = probeReachable(codename)
+        return reachable + CANDIDATES.filterNot { it in reachable }
+    }
+
+    /**
+     * Convenience: pick the best mirror and write it. When no probe succeeds the
+     * preferred (first) candidate is still written so a broken probe cannot block a
+     * mirror switch; only a write failure returns null.
      */
     fun applyBestMirror(rootfsDir: File): String? {
         val codename = detectCodename(rootfsDir)
-        val mirror = probeReachable(codename).firstOrNull() ?: return null
-        writeSources(rootfsDir, mirror, codename)
-        return mirror
+        val chosen = orderedCandidates(codename).firstOrNull() ?: return null
+        return runCatching {
+            writeSources(rootfsDir, chosen, codename)
+            chosen
+        }.getOrNull()
     }
 }

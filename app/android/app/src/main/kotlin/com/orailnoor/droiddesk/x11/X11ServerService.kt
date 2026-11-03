@@ -91,7 +91,12 @@ class X11ServerService : Service() {
                         Log.e(TAG, "Native X server failed to start", error)
                         false
                     } finally {
-                        started = true
+                        // A failed start used to latch success=false for the lifetime of the
+                        // process; retrying asked a dead CmdEntryPoint again and every later
+                        // resolution switch inherited the broken server. Only a real success
+                        // is sticky, failures release the latch so a fresh attempt can run.
+                        started = startSucceeded
+                        if (!startSucceeded) startLatch = null
                         latch.countDown()
                     }
                     Log.i(TAG, "Native X server start result=$startSucceeded")

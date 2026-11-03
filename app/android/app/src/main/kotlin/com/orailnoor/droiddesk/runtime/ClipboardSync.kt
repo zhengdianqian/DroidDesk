@@ -33,22 +33,49 @@ class ClipboardSync(
         override fun run() {
             if (!running.get()) return
             if (busy.compareAndSet(false, true)) synchronizeOnce()
-            handler.postDelayed(this, 1600)
+            // Android -> Linux is fully event driven (see `listener`); this timer only
+            // has to pick up Linux -> Android copies. 4s instead of 1.6s halves the
+            // number of xclip processes spawned while the desktop is idle.
+            handler.postDelayed(this, 4000)
+        }
+    }
+
+    private val listener = ClipboardManager.OnPrimaryClipChangedListener {
+        if (!running.get() || !busy.compareAndSet(false, true)) return@OnPrimaryClipChangedListener
+        val androidText = readAndroidClip()
+        thread(name = "clipboard-push", isDaemon = true) {
+            try {
+                if (lastAndroid == null) {
+                    rememberAndroid(androidText)
+                } else if (androidText != lastAndroid) {
+                    if (writeLinux(androidText)) rememberLinux(androidText)
+                    rememberAndroid(androidText)
+                }
+            } catch (error: Throwable) {
+                Log.d(TAG, "Clipboard push unavailable: ${error.message}")
+            } finally {
+                busy.set(false)
+            }
         }
     }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        clipboard.addPrimaryClipChangedListener(listener)
         handler.post(tick)
     }
 
     fun stop() {
         running.set(false)
         handler.removeCallbacks(tick)
+        clipboard.removePrimaryClipChangedListener(listener)
     }
 
+    private fun readAndroidClip(): String =
+        clipboard.primaryClip?.getItemAt(0)?.coerceToText(appContext)?.toString().orEmpty()
+
     private fun synchronizeOnce() {
-        val androidText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(appContext)?.toString().orEmpty()
+        val androidText = readAndroidClip()
         thread(name = "clipboard-sync", isDaemon = true) {
             try {
                 val linuxText = readLinux() ?: return@thread

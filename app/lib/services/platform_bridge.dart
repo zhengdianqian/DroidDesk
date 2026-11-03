@@ -477,9 +477,12 @@ class DroidDeskPlatform {
     return await _channel.invokeMethod<bool>('repairPackageManager') ?? false;
   }
 
-  /// Switches the guest to the fastest reachable domestic Ubuntu mirror.
-  static Future<bool> applyBestMirror() async {
-    return await _channel.invokeMethod<bool>('applyBestMirror') ?? false;
+  /// Switches the guest to the fastest reachable domestic mirror.
+  ///
+  /// Returns a structured code: `Ok`, `NoNetwork`, `AptFailed` or `Unsupported`.
+  /// A failed reachability probe is never reported as a missing mirror.
+  static Future<String> applyBestMirror() async {
+    return await _channel.invokeMethod<String>('applyBestMirror') ?? 'Unsupported';
   }
 
   /// Prints the guest package-manager health report (arch, sources, DNS, locks,
