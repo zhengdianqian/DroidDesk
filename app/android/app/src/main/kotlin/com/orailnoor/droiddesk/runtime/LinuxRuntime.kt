@@ -264,6 +264,8 @@ class LinuxRuntime(private val context: Context) {
             mkdir -p "${tmpDir.absolutePath}/proot"
             exec "${File(binDir, "proot-distro").absolutePath}" login debian \
                 --bind "${tmpDir.absolutePath}:/tmp" \
+                --bind "${prefixDir.absolutePath}:/data/data/com.termux/files/usr" \
+                --bind "${homeDir.absolutePath}:/data/data/com.termux/files/home" \
                 --env PROOT_TMP_DIR="${tmpDir.absolutePath}/proot" \
                 --env PROOT_LOADER="${File(prefixDir, "libexec/proot/loader").absolutePath}" \
                 --env PROOT_LOADER_32="${File(prefixDir, "libexec/proot/loader32").absolutePath}" -- \
@@ -281,6 +283,8 @@ class LinuxRuntime(private val context: Context) {
             mode="${'$'}{1:-gui}"
             exec "${File(binDir, "proot-distro").absolutePath}" login debian \
                 --bind "${tmpDir.absolutePath}:/tmp" \
+                --bind "${prefixDir.absolutePath}:/data/data/com.termux/files/usr" \
+                --bind "${homeDir.absolutePath}:/data/data/com.termux/files/home" \
                 --env PROOT_TMP_DIR="${tmpDir.absolutePath}/proot" \
                 --env PROOT_LOADER="${File(prefixDir, "libexec/proot/loader").absolutePath}" \
                 --env PROOT_LOADER_32="${File(prefixDir, "libexec/proot/loader32").absolutePath}" -- \
@@ -465,11 +469,25 @@ class LinuxRuntime(private val context: Context) {
             val confFile = File(aptConfDir, "99-droiddesk-paths.conf")
             confFile.writeText(
                 """
+                # Every apt directory is named explicitly: the bootstrap's apt was
+                # compiled for /data/data/com.termux/files/usr, and the LD_PRELOAD
+                # path hook does not intercept every libc call on every Android
+                # build. Explicit paths keep apt off the unreadable literal prefix.
                 Dir "${prefixDir.absolutePath}";
                 Dir::Etc "${prefixDir.absolutePath}/etc/apt";
+                Dir::Etc::main "${prefixDir.absolutePath}/etc/apt/apt.conf";
+                Dir::Etc::parts "${prefixDir.absolutePath}/etc/apt/apt.conf.d";
+                Dir::Etc::sourcelist "${prefixDir.absolutePath}/etc/apt/sources.list";
+                Dir::Etc::sourceparts "${prefixDir.absolutePath}/etc/apt/sources.list.d";
+                Dir::Etc::preferences "${prefixDir.absolutePath}/etc/apt/preferences";
+                Dir::Etc::preferencesparts "${prefixDir.absolutePath}/etc/apt/preferences.d";
+                Dir::Etc::trusted "${prefixDir.absolutePath}/etc/apt/trusted.gpg";
+                Dir::Etc::trustedparts "${prefixDir.absolutePath}/etc/apt/trusted.gpg.d";
                 Dir::State "${prefixDir.absolutePath}/var/lib/apt";
+                Dir::State::status "${prefixDir.absolutePath}/var/lib/dpkg/status";
                 Dir::State::dpkg "${prefixDir.absolutePath}/var/lib/dpkg";
                 Dir::Cache "${prefixDir.absolutePath}/var/cache/apt";
+                Dir::Cache::archives "${prefixDir.absolutePath}/var/cache/apt/archives";
                 Dir::Log "${prefixDir.absolutePath}/var/log/apt";
                 Dir::Bin::Methods "${prefixDir.absolutePath}/lib/apt/methods";
                 Dir::Bin::dpkg "${prefixDir.absolutePath}/bin/dpkg";
@@ -1522,6 +1540,83 @@ class LinuxRuntime(private val context: Context) {
         }
     }
 
+    /**
+     * Export the relocated prefix to every interactive shell, unconditionally.
+     *
+     * The bootstrap's apt/dpkg were compiled with Termux's literal prefix. When the
+     * LD_PRELOAD hook is not active (some Android builds ignore it for new binaries)
+     * apt tries to read /data/data/com.termux/files/usr/... and fails with EACCES.
+     * APT_CONFIG + DPKG_ADMINDIR + PREFIX make apt use this app's writable prefix even
+     * in shells that do not inherit the Kotlin-side environment. The block is
+     * idempotent and bounded by markers so repeated launches do not grow .bashrc.
+     */
+    private fun ensurePackageManagerEnv() {
+        val bashrc = File(homeDir, ".bashrc")
+        val startMarker = "# droiddesk-package-env:start"
+        val endMarker = "# droiddesk-package-env:end"
+        runCatching {
+            val current = bashrc.readTextOrNull().orEmpty()
+            val cleaned = current.replace(
+                Regex(
+                    Regex.escape(startMarker) + "[\\s\\S]*?" + Regex.escape(endMarker) + "\\n?",
+                ),
+                "",
+            )
+            val block = buildString {
+                appendLine(startMarker)
+                appendLine("export PREFIX=${prefixDir.absolutePath}")
+                appendLine("export TERMUX_PREFIX=${prefixDir.absolutePath}")
+                appendLine("export TERMUX__PREFIX=${prefixDir.absolutePath}")
+                appendLine("export APT_CONFIG=${prefixDir.absolutePath}/etc/apt/apt.conf.d/99-droiddesk-paths.conf")
+                appendLine("export DPKG_ADMINDIR=${prefixDir.absolutePath}/var/lib/dpkg")
+                appendLine("export TMPDIR=${tmpDir.absolutePath}")
+                appendLine("export PATH=${prefixDir.absolutePath}/bin:\$PATH")
+                append(endMarker)
+                appendLine()
+            }
+            bashrc.parentFile?.mkdirs()
+            bashrc.writeText(cleaned + (if (cleaned.isEmpty() || cleaned.endsWith("\n")) "" else "\n") + block)
+        }.onFailure {
+            DesktopLog.append(context, TAG, "package env block failed: ${it.message}")
+        }
+    }
+
+    /**
+     * Copy the desktop entries of common Linux apps into ~/Desktop so a freshly
+     * installed app is reachable without digging through the application menu.
+     * Only a short whitelist is mirrored: dumping every .desktop file would clutter
+     * the phone-sized desktop with Xfce internals. A directory listing is cheap, so
+     * this runs on every session start and after each store install.
+     */
+    private fun exportDesktopShortcuts() {
+        val desktopDir = File(homeDir, "Desktop").apply { mkdirs() }
+        val appDirs = listOf(
+            File(prefixDir, "share/applications"),
+            File(homeDir, ".local/share/applications"),
+        )
+        val wanted = listOf(
+            "firefox", "chromium", "google-chrome", "code", "gimp", "vlc", "mpv",
+            "libreoffice-writer", "libreoffice-calc", "libreoffice-impress",
+        )
+        runCatching {
+            appDirs.asSequence()
+                .flatMap { dir ->
+                    dir.listFiles { file -> file.isFile && file.name.endsWith(".desktop") }
+                        ?.asSequence() ?: emptySequence<File>()
+                }
+                .filter { file -> wanted.any { file.name.startsWith(it) } }
+                .forEach { file ->
+                    val target = File(desktopDir, file.name)
+                    if (!target.exists()) {
+                        file.copyTo(target)
+                        target.setExecutable(true, false)
+                    }
+                }
+        }.onFailure {
+            DesktopLog.append(context, TAG, "desktop shortcut export failed: ${it.message}")
+        }
+    }
+
     // ── Environment Configuration ──
 
     private fun getTermuxEnv(): Map<String, String> {
@@ -1538,6 +1633,9 @@ class LinuxRuntime(private val context: Context) {
         env["TERMUX_APP__PACKAGE_NAME"] = context.packageName
         env["TERMUX__PREFIX"] = prefixDir.absolutePath
         env["TERMUX__HOME"] = homeDir.absolutePath
+        // Legacy spellings still used by bootstrap scripts and pkg/apt wrappers.
+        env["TERMUX_PREFIX"] = prefixDir.absolutePath
+        env["TERMUX_HOME"] = homeDir.absolutePath
         env["TERMUX_VERSION"] = "DroidDesk"
         env["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
         env["PATH"] = listOf(
@@ -2541,6 +2639,7 @@ class LinuxRuntime(private val context: Context) {
                 ),
             )
             mark("profile:end")
+            exportDesktopShortcuts()
             // Enumerating every installed Android app through python costs ~40 s and
             // changes rarely, so refresh at most once every six hours.
             val syncMarker = File(baseDir, ".android_apps_synced")
@@ -2574,6 +2673,7 @@ class LinuxRuntime(private val context: Context) {
         ensureTextInjector()
         mark("type-probe")
         ensureStoreProxyConfig()
+        ensurePackageManagerEnv()
         mark("store-proxy")
         onPhase("启动会话总线")
 
@@ -2943,6 +3043,35 @@ DROIDDESK_X11
                         ( xfdesktop >/dev/null 2>&1 & )
                         echo "DIAG: xfdesktop restarted"
                     fi
+                fi
+            ) &
+            # xfwm4 can die during cold start (Gdk-ERROR). A desktop without a window
+            # manager never gives keyboard focus to a widget, so the IME bridge reads
+            # "no editable focus" and the Android keyboard stops popping up. Verify the
+            # WM once with a bounded loop and restart it a single time; no persistent
+            # watchdog is installed, by design.
+            (
+                for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+                    sleep 0.5
+                    if command -v xprop >/dev/null 2>&1; then
+                        xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && exit 0
+                    else
+                        ps -A -o comm= 2>/dev/null | grep -qx xfwm4 && exit 0
+                    fi
+                done
+                echo "DIAG: xfwm4 not alive after 15s, restarting once"
+                (
+                    xfwm4 --replace --sm-client-disable 2>&1 | tee -a "${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                ) &
+                sleep 3
+                if command -v xprop >/dev/null 2>&1; then
+                    xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' \
+                        && echo "DIAG: xfwm4 recovered" \
+                        || echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
+                else
+                    ps -A -o comm= 2>/dev/null | grep -qx xfwm4 \
+                        && echo "DIAG: xfwm4 recovered" \
+                        || echo "DIAG: xfwm4 restart failed, see ${tmpDir.absolutePath}/droiddesk-xfwm4.log"
                 fi
             ) &
             exec $desktopCommand

@@ -17,7 +17,7 @@ import kotlin.math.roundToInt
  */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_VERSION = "v16"
+    private const val PROFILE_VERSION = "v17"
     private const val MONOSPACE_FONT = "DejaVu Sans Mono"
     private const val WALLPAPER_ASSET = "droiddesk/sunset-wave-wallpaper.jpg"
 
@@ -107,6 +107,13 @@ object XfceMobileProfile {
                 exec = "exo-open --launch WebBrowser %u",
                 icon = "org.xfce.webbrowser",
             )
+            writeLauncher(
+                File(panelDir, "launcher-25/droiddesk-settings.desktop"),
+                name = "Settings",
+                comment = "Display, network and input settings",
+                exec = "xfce4-settings-manager",
+                icon = "preferences-system",
+            )
             // Desktop shortcut for the store, so it is reachable without the dock.
             writeLauncher(
                 File(homeDir, "Desktop/droiddesk-store.desktop"),
@@ -186,6 +193,13 @@ object XfceMobileProfile {
             $startMarker
             .xfce4-panel button {
               padding: ${pad}px ${side}px;
+              border-radius: ${(12 * s).roundToInt()}px;
+            }
+            /* Touch-sized feedback for the dock; no transitions, the power saver
+               profile must not spend frames on animation. */
+            .xfce4-panel button:hover,
+            .xfce4-panel button:active {
+              background-color: rgba(255, 255, 255, 0.16);
             }
             .xfce4-panel .tasklist button {
               min-width: ${(34 * s).roundToInt()}px;
@@ -376,16 +390,17 @@ object XfceMobileProfile {
                   <property name="icon-size" type="uint" value="$dockIcon"/>
                   <property name="background-style" type="uint" value="1"/>
                   <property name="background-rgba" type="array">
-                    <value type="double" value="0.965000"/>
-                    <value type="double" value="0.961000"/>
-                    <value type="double" value="0.957000"/>
-                    <value type="double" value="0.000000"/>
+                    <value type="double" value="0.180000"/>
+                    <value type="double" value="0.180000"/>
+                    <value type="double" value="0.190000"/>
+                    <value type="double" value="0.920000"/>
                   </property>
                   <property name="plugin-ids" type="array">
                     <value type="int" value="21"/>
                     <value type="int" value="22"/>
                     <value type="int" value="23"/>
                     <value type="int" value="24"/>
+                    <value type="int" value="25"/>
                   </property>
                 </property>
               </property>
@@ -430,6 +445,11 @@ object XfceMobileProfile {
                 <property name="plugin-24" type="string" value="launcher">
                   <property name="items" type="array">
                     <value type="string" value="droiddesk-browser.desktop"/>
+                  </property>
+                </property>
+                <property name="plugin-25" type="string" value="launcher">
+                  <property name="items" type="array">
+                    <value type="string" value="droiddesk-settings.desktop"/>
                   </property>
                 </property>
               </property>

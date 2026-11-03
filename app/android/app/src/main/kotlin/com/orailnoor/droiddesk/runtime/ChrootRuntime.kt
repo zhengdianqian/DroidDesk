@@ -478,6 +478,8 @@ class ChrootRuntime(private val context: Context) {
         // Cheap (no apt): keeps the desktop store, .deb handler and IME watcher present
         // even on rootfs images that were installed before this version.
         ensureGuestScripts()
+        applyHostProxyConfig()
+        exportDesktopShortcuts()
 
         onPhase("启动桌面会话")
 
@@ -499,6 +501,19 @@ class ChrootRuntime(private val context: Context) {
 
             # Source DroidDesk environment
             . /etc/profile.d/droiddesk-ha.sh 2>/dev/null || true
+
+            # The chroot shares the device network stack. When the host-wide proxy is
+            # actually listening it also resolves names, so expose it to apt/curl/wget
+            # launched from the desktop. The config file is only written while the
+            # probe succeeds, so a dead proxy can never shadow a direct connection.
+            if [ -f /etc/apt/apt.conf.d/99droiddesk-proxy ]; then
+                export http_proxy=http://127.0.0.1:2080
+                export https_proxy=http://127.0.0.1:2080
+                export HTTP_PROXY=http://127.0.0.1:2080
+                export HTTPS_PROXY=http://127.0.0.1:2080
+                export no_proxy=127.0.0.1,localhost,::1
+                export NO_PROXY=127.0.0.1,localhost,::1
+            fi
 
             # Make sure X11 socket dir exists in case bind mount was late
             mkdir -p /tmp/.X11-unix
@@ -568,6 +583,36 @@ fi
 # The focus watcher only needs dbus-monitor; start it even when IBus is absent so an
 # older image still reports editable-focus changes (it keeps writing 0 otherwise).
 command -v droiddesk-ime-watch >/dev/null 2>&1 && droiddesk-ime-watch >/dev/null 2>&1 &
+# xfwm4 occasionally dies at cold start with a Gdk-ERROR. Without a window
+# manager there is no keyboard focus, so the IME bridge never sees an editable
+# widget and the keyboard stops popping up. Check once (bounded loop, ~15 s)
+# and restart xfwm4 a single time inside this session bus; no persistent
+# watchdog is installed, by design. No shell variables are used here because
+# this file is written through an expanding heredoc.
+(
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        sleep 0.5
+        if command -v xprop >/dev/null 2>&1; then
+            xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && exit 0
+        else
+            ps -A -o comm= 2>/dev/null | grep -qx xfwm4 && exit 0
+        fi
+    done
+    echo "DIAG: xfwm4 not alive after 15s, restarting once"
+    (
+        xfwm4 --replace --sm-client-disable 2>&1 | tee -a /tmp/droiddesk-xfwm4.log
+    ) &
+    sleep 3
+    if command -v xprop >/dev/null 2>&1; then
+        xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' \
+            && echo "DIAG: xfwm4 recovered" \
+            || echo "DIAG: xfwm4 restart failed, see /tmp/droiddesk-xfwm4.log"
+    else
+        ps -A -o comm= 2>/dev/null | grep -qx xfwm4 \
+            && echo "DIAG: xfwm4 recovered" \
+            || echo "DIAG: xfwm4 restart failed, see /tmp/droiddesk-xfwm4.log"
+    fi
+) &
 exec ${'$'}DE_BIN
 SESSEOF
             chmod +x /tmp/droiddesk-session.sh
@@ -985,6 +1030,70 @@ SESSEOF
     }
 
     /**
+     * Point apt at the device-wide HTTP proxy only while it is actually listening.
+     * The chroot has no resolver of its own; the proxy resolves host names. Probing
+     * first (and deleting the config when it stops responding) keeps a dead proxy
+     * from shadowing a direct connection.
+     */
+    private fun applyHostProxyConfig() {
+        if (!hasRoot() || !isRootfsReady()) return
+        val reachable = runCatching {
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", 2080), 400)
+            }
+            true
+        }.getOrDefault(false)
+        val path = "/etc/apt/apt.conf.d/99droiddesk-proxy"
+        if (!reachable) {
+            val removed = execChroot("rm -f $path") == 0
+            if (removed) DesktopLog.append(context, TAG, "host proxy unreachable; apt uses direct")
+            return
+        }
+        val command = """
+            mkdir -p /etc/apt/apt.conf.d
+            cat > $path <<'DROIDDESK_PROXY'
+            # DroidDesk: the guest has no resolver; let the host proxy resolve and fetch.
+            Acquire::http::Proxy "http://127.0.0.1:2080";
+            Acquire::https::Proxy "http://127.0.0.1:2080";
+            DROIDDESK_PROXY
+        """.trimIndent()
+        val code = execChroot(command)
+        DesktopLog.append(
+            context,
+            TAG,
+            if (code == 0) "host proxy config written" else "host proxy config failed ($code)",
+        )
+    }
+
+    /**
+     * Mirror the desktop entries of common Linux apps into /root/Desktop. Runs on
+     * each session start and after each install; a whitelist keeps phone-sized
+     * desktops free of Xfce internals.
+     */
+    private fun exportDesktopShortcuts() {
+        if (!hasRoot() || !isRootfsReady()) return
+        val command = """
+            mkdir -p /root/Desktop
+            for d in /usr/share/applications /usr/local/share/applications /root/.local/share/applications; do
+                [ -d "${'$'}d" ] || continue
+                for f in "${'$'}d"/*.desktop; do
+                    [ -f "${'$'}f" ] || continue
+                    grep -qi '^NoDisplay=true' "${'$'}f" && continue
+                    name=${'$'}(basename "${'$'}f")
+                    case "${'$'}name" in
+                        firefox*|chromium*|google-chrome*|code*|gimp*|vlc*|mpv*|libreoffice-*)
+                            [ -e "/root/Desktop/${'$'}name" ] || cp -f "${'$'}f" "/root/Desktop/${'$'}name"
+                            ;;
+                    esac
+                done
+            done
+            chmod +x /root/Desktop/*.desktop 2>/dev/null || true
+            chown root:root /root/Desktop/*.desktop 2>/dev/null || true
+        """.trimIndent()
+        execChroot(command)
+    }
+
+    /**
      * Writes the in-guest helper programs (desktop store, .deb handler, IBus focus watcher)
      * plus their menu entries and the .deb MIME association. The scripts are staged in app
      * storage and copied through `su`, because /usr and /root are root-owned.
@@ -1163,6 +1272,7 @@ SESSEOF
                 capture,
             )
             if (first == 0) {
+                exportDesktopShortcuts()
                 onProgress(1.0, t("$packageName 安装完成", "$packageName installed"))
                 return true
             }
@@ -1176,6 +1286,7 @@ SESSEOF
             )
             val ok = second == 0
             if (ok) {
+                exportDesktopShortcuts()
                 onProgress(1.0, t("$packageName 安装完成", "$packageName installed"))
             } else {
                 val tail = captured.lines()

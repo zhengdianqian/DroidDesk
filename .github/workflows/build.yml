@@ -71,15 +71,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: DroidDesk 1.4.4
+          name: DroidDesk 1.4.5
           fail_on_unmatched_files: true
           files: DroidDesk-${{ github.ref_name }}-arm64.apk
           body: |
-            ## DroidDesk 1.4.4
+            ## DroidDesk 1.4.5
 
-            基于 1.4.3 继续迭代，versionCode 13，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
+            基于 1.4.4 继续迭代，versionCode 14，沿用同一签名（`droiddesk-release.jks`），可直接覆盖安装。
 
-            ### 1.4.4 更新
+            ### 1.4.5 更新
+            - 窗口管理器兜底：桌面会话启动后检查 `_NET_SUPPORTING_WM_CHECK`，确认 xfwm4 存活；冷启动崩溃时用会话总线环境重启一次（只重试一次，不驻留看护），并把 xfwm4 的 stderr 写入桌面日志
+            - 商店装包：apt 显式重定位 `Dir::Etc`/`Dir::State`/`Dir::Bin::Methods` 与 dpkg 状态库，导出 `PREFIX`/`TERMUX_PREFIX`/`APT_CONFIG`/`DPKG_ADMINDIR` 到桌面终端；PRoot 容器把 `/data/data/com.termux/files/usr` 绑到应用前缀；宿主 `127.0.0.1:2080` 代理探测可用才写入，不可用则移除
+            - 桌面观感：底部 Dock 增加设置入口、圆角与悬停反馈，常用应用的 `.desktop` 自动复制到桌面
+            - 输入法：候选词连击与多字中文提交去重路径复核，补全日志
+
+            ### 1.4.4 更新（沿用）
             - 输入法上屏：`sendTextEvent` 在 VTE 中不生效，改为内置 `droiddesk-x11-type`（XTest）；ASCII 走 keysym + 必要时 Shift，中文等非 Latin-1 字符映射为 Unicode keysym（`0x01000000 | codepoint`）后由 XTest 按下，候选词提交可真正进入终端
             - 输入法桥的删除、回车也改走同一注入通道（组合预览改动只删差异字符）
             - 商店网络：启动时探测设备代理 `127.0.0.1:2080`，可用则写入 apt `Acquire::http/https::Proxy` 与 `~/.bashrc`/运行时 `http_proxy/https_proxy`，由代理解析域名，绕开 guest 无法解析 DNS 的问题

@@ -1381,7 +1381,7 @@ private class GuestImeAnchor(
             // path subtracts what was already mirrored instead of retyping it.
             private var composing = ""
 
-            private fun commitToX(text: CharSequence?): Boolean {
+            private fun commitToX(text: CharSequence?, replaced: Int = 0): Boolean {
                 val value = text?.toString().orEmpty()
                 if (value.isNotEmpty()) {
                     // XTest injection: Termux:X11's sendTextEvent() never reached VTE, so
@@ -1390,8 +1390,14 @@ private class GuestImeAnchor(
                 }
                 // Keep the anchor itself empty; it is not a visible editor.
                 super.commitText("", 1)
-                if (value.isNotEmpty()) {
-                    DesktopLog.append(ctx, "IMEBRIDGE", "commit ${value.length} chars")
+                if (value.isNotEmpty() || replaced > 0) {
+                    // One line per commit: enough to tell apart a duplicated candidate
+                    // tap from a lost multi-character commit in a bug report.
+                    DesktopLog.append(
+                        ctx,
+                        "IMEBRIDGE",
+                        "commit ${value.length} chars, replaced $replaced preview chars",
+                    )
                 }
                 return true
             }
@@ -1401,16 +1407,21 @@ private class GuestImeAnchor(
                 val mirrored = composing
                 composing = ""
                 if (value == mirrored) {
-                    // Already on screen from setComposingText; nothing to do.
+                    // Several Chinese IMEs re-send the composing text as the commit
+                    // (candidate == preview). It is already on screen; typing it again
+                    // would duplicate the word, so only the anchor is cleared.
                     super.commitText("", 1)
                     return true
                 }
+                var replaced = 0
                 if (mirrored.isNotEmpty()) {
-                    // The IME changed the word between composing and commit; replace
-                    // the mirrored preview before sending the final text.
-                    deleteText(mirrored.length.coerceAtMost(32))
+                    // The IME changed the word between preview and commit. Delete exactly
+                    // the mirrored characters: an arbitrary cap would leave the tail of a
+                    // long pinyin preview behind and then type the final text after it.
+                    replaced = mirrored.length
+                    deleteText(replaced)
                 }
-                return commitToX(value)
+                return commitToX(value, replaced)
             }
 
             // Android 13+ IMEs (including the Chinese keyboards users run here) call the
