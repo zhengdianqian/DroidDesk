@@ -44,6 +44,11 @@ object DesktopLog {
         enabled = value
         if (!value) {
             synchronized(pendingLock) { pending.clear() }
+            // Drop the writer too: with logging off there must be no idle flush thread.
+            synchronized(this) {
+                executor?.shutdown()
+                executor = null
+            }
             externalResolved = false
             cachedExternal = null
         }
