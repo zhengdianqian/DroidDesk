@@ -627,11 +627,17 @@ int execvpe(const char *file, char *const argv[], char *const envp[]) {
  */
 #define DROIDDESK_MAX_EXEC_ARGS 40
 
-static int call_execl(int (*fn)(const char *, ...), const char *path, va_list ap) {
+static int call_execl(int (*fn)(const char *, ...), const char *path,
+                      const char *arg0, va_list ap) {
     const char *args[DROIDDESK_MAX_EXEC_ARGS];
     int n = 0;
-    const char *a;
-    while ((a = va_arg(ap, const char *)) != NULL && n < DROIDDESK_MAX_EXEC_ARGS) {
+    const char *a = NULL;
+    /* execl(path, argv0, argv1, ...) passes argv[0] as a named parameter and
+     * only argv[1..] arrive through the varargs. Skipping arg0 here dropped the
+     * first real argument, which made helpers spawned via execl - dpkg-split
+     * being the obvious one - fail with "need an action option". */
+    if (arg0 != NULL) args[n++] = arg0;
+    while (n < DROIDDESK_MAX_EXEC_ARGS && (a = va_arg(ap, const char *)) != NULL) {
         args[n++] = a;
     }
     if (a != NULL) {
@@ -664,7 +670,7 @@ int execl(const char *pathname, const char *arg, ...) {
     const char *path = rewrite_path(pathname, buf, sizeof(buf));
     va_list ap;
     va_start(ap, arg);
-    int rc = call_execl(real_execl, path, ap);
+    int rc = call_execl(real_execl, path, arg, ap);
     va_end(ap);
     return rc;
 }
@@ -676,7 +682,7 @@ int execlp(const char *file, const char *arg, ...) {
     const char *path = rewrite_path(file, buf, sizeof(buf));
     va_list ap;
     va_start(ap, arg);
-    int rc = call_execl(real_execlp, path, ap);
+    int rc = call_execl(real_execlp, path, arg, ap);
     va_end(ap);
     return rc;
 }
@@ -692,8 +698,9 @@ int execle(const char *pathname, const char *arg, ...) {
     int n = 0;
     va_list ap;
     va_start(ap, arg);
-    const char *a;
-    while ((a = va_arg(ap, const char *)) != NULL && n < DROIDDESK_MAX_EXEC_ARGS) {
+    const char *a = NULL;
+    if (arg != NULL) args[n++] = arg;
+    while (n < DROIDDESK_MAX_EXEC_ARGS && (a = va_arg(ap, const char *)) != NULL) {
         args[n++] = a;
     }
     char *const *envp = a ? NULL : (char *const *)va_arg(ap, char *const *);

@@ -17,7 +17,7 @@ import kotlin.math.roundToInt
  */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_VERSION = "v17"
+    private const val PROFILE_VERSION = "v18"
     private const val MONOSPACE_FONT = "DejaVu Sans Mono"
     private const val WALLPAPER_ASSET = "droiddesk/sunset-wave-wallpaper.jpg"
 
@@ -358,7 +358,9 @@ object XfceMobileProfile {
                 <property name="dark-mode" type="bool" value="false"/>
                 <property name="panel-1" type="empty">
                   <property name="position" type="string" value="p=6;x=0;y=0"/>
-                  <property name="length" type="uint" value="1"/>
+                  <!-- length is a percentage while length-adjust is on: 1 meant the top
+                       bar collapsed to ~11px and every plugin but the clock was clipped. -->
+                  <property name="length" type="uint" value="100"/>
                   <property name="length-adjust" type="bool" value="true"/>
                   <property name="position-locked" type="bool" value="true"/>
                   <property name="autohide-behavior" type="uint" value="0"/>
@@ -382,7 +384,8 @@ object XfceMobileProfile {
                 <property name="panel-2" type="empty">
                   <property name="position" type="string" value="p=10;x=0;y=0"/>
                   <property name="mode" type="uint" value="0"/>
-                  <property name="length" type="uint" value="1"/>
+                  <!-- Same unit as panel-1: the dock was only 1% wide before. -->
+                  <property name="length" type="uint" value="100"/>
                   <property name="length-adjust" type="bool" value="true"/>
                   <property name="position-locked" type="bool" value="true"/>
                   <property name="autohide-behavior" type="uint" value="$dockAutohide"/>
