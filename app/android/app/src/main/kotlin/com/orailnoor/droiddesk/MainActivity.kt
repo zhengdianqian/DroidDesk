@@ -958,9 +958,12 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopLinux" -> {
-                    // A desktop screen left in the back stack would reopen onto a dead session.
-                    com.orailnoor.droiddesk.view.DesktopActivity.finishIfOpen()
                     thread(name = "stop-linux-session") {
+                        // Finish the desktop and wait for its onDestroy first: it holds
+                        // the :x11 binding, and stopService cannot kill a bound service.
+                        // The old code only posted finish(), so the X server (and its
+                        // socket) outlived the stop and the next start reused it.
+                        com.orailnoor.droiddesk.view.DesktopActivity.teardownAndAwait(3_000)
                         if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
                             chrootRuntime.stopSession()
                         }

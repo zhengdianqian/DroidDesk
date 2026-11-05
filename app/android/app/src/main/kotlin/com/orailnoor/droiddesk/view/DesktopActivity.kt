@@ -1347,12 +1347,24 @@ class DesktopActivity : Activity() {
             x11RetryCount++
             DesktopLog.append(this, TAG, "X11 retry 1 after cleaning stale server state")
             Thread {
+                // A bound service is never destroyed by stopService, so the old
+                // native server (and its socket) survived every retry and the
+                // reconnect kept reusing a dead connection. Unbind first, then stop.
+                x11ServiceClient?.disconnect()
+                x11ServiceClient = null
+                val oldPid = X11ServiceClient.connectedServerPid
+                X11ServiceClient.connectedServerPid = -1
                 runCatching { stopService(Intent(this, X11ServerService::class.java)) }
+                // Event-driven teardown: wait for the old server process to exit
+                // instead of a fixed sleep that raced the process death.
+                val deadline = SystemClock.elapsedRealtime() + 3_000
+                while (SystemClock.elapsedRealtime() < deadline && File("/proc/$oldPid").exists()) {
+                    Thread.sleep(100)
+                }
                 val sockets = File(filesDir, "tmp/.X11-unix")
                 runCatching { sockets.listFiles()?.forEach { it.delete() } }
                 runCatching { File(filesDir, "tmp/.X11-unix/X0").delete() }
                 runCatching { File(filesDir, "tmp/.X11-unix/.X0-lock").delete() }
-                Thread.sleep(1_500)
                 runOnUiThread {
                     x11Connected = false
                     Toast.makeText(this, "正在清理残留 X 服务器并重试…", Toast.LENGTH_SHORT).show()

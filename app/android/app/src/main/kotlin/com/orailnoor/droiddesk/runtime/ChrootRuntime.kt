@@ -407,7 +407,6 @@ class ChrootRuntime(private val context: Context) {
         }
 
         onPhase("清理上次会话残留")
-        cleanupStaleSession()
         DesktopLog.append(context, TAG, "chroot session start requested (${width}x$height)")
 
         onPhase("检查兼容库")
@@ -443,7 +442,20 @@ class ChrootRuntime(private val context: Context) {
 
         onPhase("挂载运行环境")
         ensureMounts()
+        // Only after /proc is mounted inside the chroot can the previous session's
+        // processes be seen and killed. Running this before the mounts (as the
+        // original order did) left orphans behind, and the new session then died
+        // with "another session manager is already running".
+        cleanupStaleSession()
         bindX11Socket()
+        // The X connection fd reaches LorieView before libXlorie has created the
+        // socket file. Starting the guest in that window makes every X client die
+        // silently, so the socket (not a fixed sleep) is the gate for the desktop.
+        if (!waitForX11Socket()) {
+            throw IllegalStateException(
+                "X 服务器未就绪：${x11HostDir.absolutePath}/X0 在 8 秒内未出现，请重试或检查残留 X 进程",
+            )
+        }
 
         onPhase("配置中文环境")
         // Idempotent: existing images never got 1.4.0's locale/font/IBus setup.
@@ -667,6 +679,16 @@ SESSEOF
         }
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
+            // A session that already died can never paint a first frame; fail now
+            // instead of burning the whole 45 s timeout and reporting a crash that
+            // did not happen.
+            sessionProcess?.let { session ->
+                if (!session.isAlive) {
+                    val exit = runCatching { session.exitValue() }.getOrNull()
+                    Log.w(TAG, "chroot session exited (code=$exit) before $desktopEnv was ready")
+                    return false
+                }
+            }
             val names = runCatching {
                 val command = "${getPreloadEnv()}export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
                     "ps -A -o comm="
@@ -808,8 +830,45 @@ SESSEOF
         sessionProcess = null
         DesktopSessionState.markStopped()
         DesktopLog.append(context, TAG, "chroot session stopped by user")
+        // destroyForcibly() only kills the session leader; xfce4-session/panel/xfwm4
+        // keep running and own the display socket and the chroot mounts. Unmounting
+        // before they exit detaches /tmp under live processes, and the next launch
+        // then dies with "another session manager is already running".
+        killGuestSession(5_000)
         unmountAll()
         Log.i(TAG, "Chroot session stopped")
+    }
+
+    /** Guest processes that outlive the session leader when the session is stopped. */
+    private val sessionProcessNames = listOf(
+        "xfce4-session", "xfce4-panel", "xfdesktop", "xfwm4", "xfsettingsd", "xfconfd",
+        "xfce4-power-manager", "xfce4-notifyd", "startxfce4", "dbus-run-session",
+        "startplasma-x11", "plasmashell", "kwin_x11", "ksmserver", "klauncher",
+    )
+
+    private fun guestProcessNames(): Set<String> = runCatching {
+        rootShell.exec(
+            "chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote("ps -A -o comm=")}",
+        ).lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    }.getOrDefault(emptySet())
+
+    private fun guestSessionAlive(): Boolean {
+        val names = guestProcessNames()
+        return sessionProcessNames.any { it in names }
+    }
+
+    /** Terminate the guest session, then wait (bounded) until it is really gone. */
+    private fun killGuestSession(timeoutMs: Long) {
+        if (!hasRoot() || !isRootfsReady()) return
+        runCatching {
+            execChroot(sessionProcessNames.joinToString("; ") { "pkill -9 -x $it 2>/dev/null" } + "; true")
+        }
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (!guestSessionAlive()) return
+            Thread.sleep(100)
+        }
+        Log.w(TAG, "Guest session still alive after ${timeoutMs}ms; unmount may stay busy")
     }
 
     // ── Mount handling ──
@@ -900,13 +959,32 @@ SESSEOF
     }
 
     /**
+     * Event-driven gate for the display link: LorieView receives the X connection fd
+     * before libXlorie creates the socket file, and a guest started in that window
+     * cannot connect. Poll the socket instead of sleeping a fixed time.
+     */
+    private fun waitForX11Socket(timeoutMs: Long = 8_000): Boolean {
+        val socket = File(x11HostDir, "X0")
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (socket.exists() && socket.canRead()) return true
+            Thread.sleep(100)
+        }
+        return socket.exists()
+    }
+
+    /**
      * Unmount all DroidDesk-related mounts.
      */
     fun unmountAll() {
         if (!hasRoot()) return
         val mounts = rootShell.exec("mount").lines()
+        // Deepest mount first. The old order unmounted /tmp before /tmp/.X11-unix:
+        // a lazy detach of /tmp takes the socket bind with it, so the bind survived
+        // as a detached mount and the next session never saw a clean display socket.
         val targets = listOf(
             File(rootfsDir, "tmp/.X11-unix").absolutePath,
+            File(rootfsDir, "tmp/droiddesk-bridge").absolutePath,
             File(rootfsDir, "dev/pts").absolutePath,
             File(rootfsDir, "dev/shm").absolutePath,
             File(rootfsDir, "dev").absolutePath,
@@ -915,17 +993,19 @@ SESSEOF
             File(rootfsDir, "run").absolutePath,
             File(rootfsDir, "tmp").absolutePath
         )
-        // Unmount in reverse order, be tolerant of busy mounts
-        targets.reversed().forEach { target ->
-            if (mounts.any { it.contains(" on $target ") }) {
-                try {
-                    rootShell.exec("umount -l $target 2>/dev/null || umount $target 2>/dev/null || true")
-                    Log.i(TAG, "Unmounted $target")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to unmount $target: ${e.message}")
-                }
+        targets.forEach { target ->
+            if (!mounts.any { it.contains(" on $target ") }) return@forEach
+            try {
+                // A plain umount first: it fails loudly on a busy mount instead of
+                // silently detaching a parent that still has mounted children.
+                rootShell.exec("umount $target 2>/dev/null || umount -l $target 2>/dev/null || true")
+                Log.i(TAG, "Unmounted $target")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to unmount $target: ${e.message}")
             }
         }
+        val left = rootShell.exec("mount").lines().count { it.contains(" on ${rootfsDir.absolutePath}") }
+        Log.i(TAG, "Chroot mounts remaining after unmount: $left")
     }
 
     // ── Guest Chinese environment, desktop store, and package management ──
@@ -946,8 +1026,16 @@ SESSEOF
                     "pkill -9 -x xfce4-session; pkill -9 -x xfce4-panel; pkill -9 -x xfdesktop; " +
                         "pkill -9 -x xfwm4; pkill -9 -x xfsettingsd; pkill -9 -x xfce4-power-manager; " +
                         "pkill -9 -x xfce4-notifyd; pkill -9 -x xfconfd; pkill -9 -x pulseaudio; " +
+                        "pkill -9 -x startxfce4; pkill -9 -x dbus-run-session; " +
                         "rm -f /tmp/.xfsm-ICE-* /tmp/dbus-session 2>/dev/null; true",
                 )
+                // startxfce4 aborts with "another session manager is already running"
+                // while the previous one is still exiting, so wait for the kill to
+                // really land before the new session is launched.
+                val deadline = System.currentTimeMillis() + 5_000
+                while (System.currentTimeMillis() < deadline && guestSessionAlive()) {
+                    Thread.sleep(100)
+                }
             }
             Log.i(TAG, "Stale chroot session cleaned")
         }.onFailure { Log.w(TAG, "Stale chroot cleanup failed: ${it.message}") }
